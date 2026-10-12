@@ -1,0 +1,76 @@
+<div id="story-branch-tree-launcher" class="list-group-item flex-container flexGap5" role="button" tabindex="0" title="打开剧情分支树">
+  <div class="fa-fw fa-solid fa-code-branch extensionsMenuExtensionButton"></div>
+  <span>剧情分支树</span>
+</div>
+
+<section id="story-branch-tree" class="story-branch-tree" role="dialog" aria-modal="true" aria-labelledby="story-branch-tree-title" hidden>
+  <header class="story-branch-tree__header">
+    <div class="story-branch-tree__heading">
+      <h2 id="story-branch-tree-title">剧情分支树</h2>
+      <p data-role="status" aria-live="polite"></p>
+    </div>
+    <div class="story-branch-tree__toolbar" aria-label="画布控制">
+      <div class="story-branch-tree__zoom" role="group" aria-label="缩放画布">
+        <button type="button" data-action="zoom-out" title="缩小" aria-label="缩小">−</button>
+        <span data-role="zoom-level">100%</span>
+        <button type="button" data-action="zoom-in" title="放大" aria-label="放大">+</button>
+      </div>
+      <button type="button" data-action="zoom-reset" title="让整棵树回到画布内" aria-label="重置视图"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3H5a2 2 0 0 0-2 2v4m12-6h4a2 2 0 0 1 2 2v4m0 6v4a2 2 0 0 1-2 2h-4M9 21H5a2 2 0 0 1-2-2v-4"/><circle cx="12" cy="9" r="1.5"/><path d="M12 10.5V16m-4 0h8"/></svg><span class="story-branch-tree__button-label">重置</span></button>
+      <button type="button" data-action="focus-current" title="定位到正在聊天的路线" aria-label="定位当前路线"><i class="fa-solid fa-crosshairs" aria-hidden="true"></i><span class="story-branch-tree__button-label">当前</span></button>
+      <button type="button" data-action="auto-arrange" title="按分叉关系重新排版；清除手动位置" aria-label="重新排版"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 2.5v19"/><rect x="7.5" y="3" width="12.5" height="4" rx="1"/><rect x="7.5" y="10" width="9" height="4" rx="1"/><rect x="7.5" y="17" width="12.5" height="4" rx="1"/></svg><span class="story-branch-tree__button-label">排版</span></button>
+      <button type="button" data-action="toggle-view" aria-pressed="false" aria-label="简略视图" title="简略视图"><svg class="story-branch-tree__view-icon--compact" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="4.5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 6.5v5M5 17v-5.5h14V17"/></svg><svg class="story-branch-tree__view-icon--detail" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 8h10M7 12h10M7 16h6"/></svg><span class="story-branch-tree__button-label" data-role="view-label">简略视图</span><span class="story-branch-tree__view-short" data-role="view-short">简略</span></button>
+    </div>
+    <button class="story-branch-tree__close" type="button" data-action="close-tree" title="关闭" aria-label="关闭剧情分支树"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+  </header>
+  <div class="story-branch-tree__canvas" data-role="canvas" aria-label="剧情路线关系图">
+    <div class="story-branch-tree__world" data-role="world"></div>
+    <div class="story-branch-tree__empty" data-role="empty" hidden></div>
+  </div>
+  <div class="story-branch-tree__note-editor" data-role="note-editor" role="dialog" aria-modal="true" aria-labelledby="story-branch-tree-note-title" hidden>
+    <div class="story-branch-tree__note-editor-card">
+      <h3 id="story-branch-tree-note-title" data-role="note-title">编辑备注</h3>
+      <div data-role="branch-name-field" hidden>
+        <label for="story-branch-tree-branch-name">分支名称</label>
+        <input id="story-branch-tree-branch-name" data-role="branch-name" type="text" maxlength="80" placeholder="例如：接受邀请">
+      </div>
+      <div data-role="point-name-field" hidden>
+        <label for="story-branch-tree-point-name">分叉点名称</label>
+        <input id="story-branch-tree-point-name" data-role="point-name" type="text" maxlength="80" placeholder="例如：在走廊相遇">
+      </div>
+      <div data-role="branch-summary-field" hidden>
+        <label for="story-branch-tree-branch-summary">分支摘要（留空时自动读取下一楼）</label>
+        <textarea id="story-branch-tree-branch-summary" data-role="branch-summary" maxlength="1000" rows="3" placeholder="留空时自动摘录分支的下一楼内容"></textarea>
+      </div>
+      <div data-role="point-summary-field" hidden>
+        <label for="story-branch-tree-point-summary">分叉点摘要（留空时自动读取本楼）</label>
+        <textarea id="story-branch-tree-point-summary" data-role="point-summary" maxlength="1000" rows="3" placeholder="留空时自动摘录分叉点楼层内容"></textarea>
+      </div>
+      <label for="story-branch-tree-note-input">备注（可选）</label>
+      <textarea id="story-branch-tree-note-input" data-role="note-input" maxlength="1000" rows="5" placeholder="写下这条路线的备注"></textarea>
+      <div class="story-branch-tree__note-editor-actions">
+        <button type="button" data-action="delete-branch" hidden>删除分支</button>
+        <button type="button" data-action="note-cancel">取消</button>
+        <button type="button" data-action="note-save">保存</button>
+      </div>
+    </div>
+  </div>
+  <div class="story-branch-tree__floor-detail" data-role="floor-detail" role="dialog" aria-modal="true" aria-labelledby="story-branch-tree-floor-title" hidden>
+    <div class="story-branch-tree__floor-detail-card">
+      <div class="story-branch-tree__floor-detail-heading">
+        <h3 id="story-branch-tree-floor-title" data-role="floor-title"></h3>
+        <button type="button" data-action="close-floor-detail" aria-label="关闭楼层内容">×</button>
+      </div>
+      <div class="story-branch-tree__floor-detail-content" data-role="floor-content"></div>
+    </div>
+  </div>
+</section>
+<div id="story-branch-tree-confirm" class="story-branch-tree__action-confirm" role="dialog" aria-modal="true" aria-labelledby="story-branch-tree-confirm-title" aria-describedby="story-branch-tree-confirm-message" hidden>
+  <div class="story-branch-tree__note-editor-card story-branch-tree__confirm-card">
+    <h3 id="story-branch-tree-confirm-title" data-role="confirm-title">确认操作</h3>
+    <p id="story-branch-tree-confirm-message" data-role="confirm-message"></p>
+    <div class="story-branch-tree__note-editor-actions">
+      <button type="button" data-action="confirm-cancel">取消</button>
+      <button type="button" data-action="confirm-accept">确认</button>
+    </div>
+  </div>
+</div>

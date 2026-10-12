@@ -1,0 +1,10 @@
+{
+  "name": "sillytavern-story-branch-tree",
+  "version": "0.1.59",
+  "private": true,
+  "type": "module",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "scripts": {
+    "check": "node --check index.js && node --check modules/StoryTree.js && node --test tests/*.test.mjs"
+  }
+}
