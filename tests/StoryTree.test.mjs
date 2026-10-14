@@ -21,6 +21,44 @@ function message(mes, options = {}) {
   return { name: "Rin", is_user: false, mes, ...options };
 }
 
+test("sync copies live messages once without cloning the read-only saved projection", t => {
+  const makeId = ids();
+  const initial = createStoryTree([message("回复3", {
+    swipe_id: 2, swipes: ["回复1", "回复2", "回复3"], swipe_info: [{ extra: {} }, { extra: {} }, { extra: {} }],
+  }), message("后续")], makeId);
+  const tree = syncActiveStoryBranch(initial, resolveStoryBranch(initial)).tree;
+  const live = resolveStoryBranch(tree);
+  const saved = JSON.stringify(tree);
+  const original = globalThis.structuredClone;
+  let projections = 0;
+  globalThis.structuredClone = value => {
+    if (Array.isArray(value) && value.length && value.every(item => typeof item?.mes === "string")) projections++;
+    return original(value);
+  };
+  t.after(() => { globalThis.structuredClone = original; });
+  const result = syncActiveStoryBranch(tree, live);
+  assert.equal(projections, 1);
+  assert.equal(JSON.stringify(tree), saved);
+  result.messages[0].swipe_info[2].extra.test = "new";
+  assert.equal(live[0].swipe_info[2].extra.test, undefined);
+  assert.equal(resolveStoryBranch(tree)[0].swipe_info[2].extra.test, undefined);
+});
+
+test("branch numbering uses read-only paths without cloning chat bodies", t => {
+  const makeId = ids();
+  const root = createStoryTree([message("开场"), message("分叉"), message("后续")], makeId);
+  const child = createStoryBranch(root, getStoryMessageId(resolveStoryBranch(root)[1]), undefined, makeId);
+  const saved = JSON.stringify(child);
+  const original = globalThis.structuredClone;
+  let copies = 0;
+  globalThis.structuredClone = value => { copies++; return original(value); };
+  t.after(() => { globalThis.structuredClone = original; });
+  const rows = getStoryBranchRows(child);
+  assert.equal(copies, 0);
+  assert.equal(rows.find(row => row.id === child.activeBranchId).branchNumber, "1.2.1");
+  assert.equal(JSON.stringify(child), saved);
+});
+
 test("creates a tree only when asked and forks at a stable message identity", () => {
   const chat = [message("到达路口"), message("夜色降临")];
   const makeId = ids();
@@ -134,32 +172,27 @@ test("returns to reply 1 after branching from the displayed reply 3", () => {
   assert.equal(resolveStoryBranch(branch, branch.rootBranchId)[1].swipe_id, 2);
 });
 
-test("keeps message metadata and chat-wide root state separate by route", () => {
+test("preserves generic message data in each route's fork anchor", () => {
   const chat = [
-    message("开场", { horae_meta: { locationMemory: { 城堡: { desc: "主线城堡" } }, relationships: [{ summary: "主线关系" }] } }),
-    message("分岔点", { horae_meta: { events: [{ summary: "共同事件" }] } }),
+    message("开场"),
+    message("分岔点", { routeMemory: { event: "主线事件" } }),
   ];
   const makeId = ids();
   const root = createStoryTree(chat, makeId);
   const forkId = getStoryMessageId(chat[1]);
   const left = createStoryBranch(root, forkId, "左线", makeId);
-  const leftPath = resolveStoryBranch(left).map((item, index) => index === 0
-    ? { ...item, horae_meta: { locationMemory: { 森林: { desc: "左线森林" } }, relationships: [{ summary: "左线关系" }] } }
+  const leftPath = resolveStoryBranch(left).map((item, index) => index === 1
+    ? { ...item, routeMemory: { event: "左线事件" } }
     : item);
-  const leftSynced = syncActiveStoryBranch(left, [
-    ...leftPath,
-    message("左线事件", { horae_meta: { events: [{ summary: "左线独有事件" }] } }),
-  ]).tree;
+  const leftSynced = syncActiveStoryBranch(left, leftPath).tree;
 
   const rootView = resolveStoryBranch(leftSynced, leftSynced.rootBranchId);
   const leftView = resolveStoryBranch(leftSynced, leftSynced.activeBranchId);
-  assert.equal(rootView[0].horae_meta.locationMemory.城堡.desc, "主线城堡");
-  assert.equal(leftView[0].horae_meta.locationMemory.森林.desc, "左线森林");
-  assert.deepEqual(leftView[1].horae_meta.events, [{ summary: "共同事件" }]);
-  assert.equal(leftView[2].horae_meta.events[0].summary, "左线独有事件");
+  assert.deepEqual(rootView[1].routeMemory, { event: "主线事件" });
+  assert.deepEqual(leftView[1].routeMemory, { event: "左线事件" });
 
   const right = createStoryBranch(activateStoryBranch(leftSynced, leftSynced.rootBranchId), forkId, "右线", makeId);
-  assert.equal(resolveStoryBranch(right)[0].horae_meta.locationMemory.城堡.desc, "主线城堡");
+  assert.deepEqual(resolveStoryBranch(right)[1].routeMemory, { event: "主线事件" });
 });
 
 test("rejects a missing fork anchor and a deleted message without discarding the graph", () => {

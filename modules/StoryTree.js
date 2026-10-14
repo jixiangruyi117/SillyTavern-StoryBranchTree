@@ -1,6 +1,103 @@
+import { captureMemoryState, restoreMemoryState } from "./MemoryState.js?v=0.1.68";
+
 export const TREE_METADATA_KEY = "story_branch_tree";
+export const SWIPE_MESSAGE_FIELDS_KEY = "story_branch_tree_swipe_message_fields";
 const MESSAGE_ID_KEY = "story_branch_tree_message_id";
 const VARIANT_ID_KEY = "story_branch_tree_variant_id";
+const CORE_MESSAGE_FIELDS = new Set(["__proto__", "constructor", "prototype", "extra", "mes", "name", "is_user", "is_system", "swipes", "swipe_info", "swipe_id", "variables", "send_date", "gen_started", "gen_finished"]);
+
+function adapterFieldNames(fields) {
+  if (!Array.isArray(fields) || fields.some((field) => typeof field !== "string" || !field || CORE_MESSAGE_FIELDS.has(field))) {
+    throw new Error("记忆适配器只能保存扩展自己的消息字段。");
+  }
+  return [...new Set(fields)];
+}
+
+/** Pin extension-owned fields independently of shared story text. */
+export function captureStoryBranchAdapterState(tree, branchId, messages, namespace, fields, { partial = false, copy = clone } = {}) {
+  const branch = tree.branches?.[branchId];
+  if (!branch || typeof namespace !== "string" || !namespace || CORE_MESSAGE_FIELDS.has(namespace)) {
+    throw new Error("记忆适配器或剧情路线无效。");
+  }
+  const names = adapterFieldNames(fields);
+  const previous = branch.adapterStates?.[namespace];
+  const snapshots = partial && previous ? Object.assign(Object.create(null), previous.messages) : Object.create(null);
+  for (const message of messages) {
+    const id = messageId(message);
+    if (!id) continue;
+    const values = Object.create(null);
+    for (const field of names) {
+      if (Object.hasOwn(message, field)) values[field] = copy(message[field]);
+    }
+    snapshots[id] = values;
+  }
+  branch.adapterStates = { ...branch.adapterStates, [namespace]: { ...previous, fields: names, messages: snapshots } };
+}
+
+export function adapterMetadataFieldNames(fields) {
+  if (!Array.isArray(fields) || fields.some(field => typeof field !== "string" || !field
+    || ["__proto__", "constructor", "prototype", "variables", "integrity", "main_chat", "tainted", TREE_METADATA_KEY].includes(field))) {
+    throw new Error("记忆适配器只能保存扩展自己的聊天元数据字段。");
+  }
+  return [...new Set(fields)];
+}
+
+export function captureStoryBranchAdapterMetadata(tree, branchId, metadata, namespace, fields) {
+  const branch = tree.branches?.[branchId];
+  if (!branch) throw new Error("剧情路线无效。");
+  const names = adapterMetadataFieldNames(fields);
+  const values = Object.create(null);
+  for (const field of names) if (Object.hasOwn(metadata ?? {}, field)) values[field] = clone(metadata[field]);
+  branch.adapterStates = { ...branch.adapterStates, [namespace]: {
+    ...branch.adapterStates?.[namespace], metadataFields: names, metadata: values,
+  } };
+}
+
+export function restoreStoryBranchAdapterMetadata(metadata, state) {
+  if (!state?.metadata) return;
+  for (const field of adapterMetadataFieldNames(state.metadataFields)) {
+    if (Object.hasOwn(state.metadata, field)) metadata[field] = clone(state.metadata[field]);
+    else delete metadata[field];
+  }
+}
+
+function restoreAdapterFields(messages, branch, options = {}) {
+  restoreMemoryState(branch, messages, options);
+  const copy = options.copy ?? clone;
+  for (const state of Object.values(branch.adapterStates ?? {})) {
+    const fields = adapterFieldNames(state.fields);
+    if (!state.messages || typeof state.messages !== "object" || Array.isArray(state.messages)) throw new Error("路线记忆快照损坏。");
+    for (const message of messages) {
+      if (!Object.hasOwn(state.messages, messageId(message))) continue;
+      const values = state.messages[messageId(message)];
+      if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error("路线消息记忆快照损坏。");
+      for (const field of fields) {
+        if (options.fields && !options.fields.has(field)) continue;
+        if (Object.hasOwn(values, field)) message[field] = copy(values[field]);
+        else delete message[field];
+      }
+    }
+  }
+  return messages;
+}
+
+function inheritAdapterFields(tree, next, messages) {
+  for (const [namespace, state] of Object.entries(tree.branches[tree.activeBranchId].adapterStates ?? {})) {
+    captureStoryBranchAdapterState(next, next.activeBranchId, messages, namespace, state.fields);
+    if (state.metadata) captureStoryBranchAdapterMetadata(next, next.activeBranchId, state.metadata, namespace, state.metadataFields);
+  }
+}
+
+function restoreSelectedSwipeFields(reply, selectedExtra, target, registeredFields = []) {
+  const current = reply.extra?.[SWIPE_MESSAGE_FIELDS_KEY];
+  const selected = selectedExtra?.[SWIPE_MESSAGE_FIELDS_KEY];
+  const fields = adapterFieldNames([...new Set([...registeredFields, ...Object.keys(current ?? {}), ...Object.keys(selected ?? {})])]);
+  for (const field of fields) {
+    const value = selected?.[field];
+    if (value?.present === true) target[field] = clone(value.value);
+    else delete target[field];
+  }
+}
 
 function clone(value) {
   return structuredClone(value);
@@ -121,42 +218,118 @@ function snapshotActiveSwipe(message) {
   return snapshot;
 }
 
-function branchPath(tree, branchId, seen = new Set()) {
-  if (seen.has(branchId)) throw new Error("剧情树包含循环引用，无法打开路线。");
-  const branch = tree.branches?.[branchId];
-  if (!branch) throw new Error("剧情路线不存在。");
-  if (!branch.parentBranchId) {
-    return branch.messageIds.map((id) => {
-      const message = tree.messages?.[id];
-      if (!message) throw new Error("剧情树缺少消息数据，请先恢复聊天备份。");
-      return clone(message);
-    });
+function routeSegments(tree, branchId) {
+  const chain = [];
+  const seen = new Set();
+  for (let id = branchId; id; id = tree.branches[id].parentBranchId) {
+    if (seen.has(id)) throw new Error("剧情树包含循环引用，无法打开路线。");
+    const branch = tree.branches?.[id];
+    if (!branch) throw new Error("剧情路线不存在。");
+    seen.add(id);
+    if (!Array.isArray(branch.messageIds) || typeof branch.title !== "string") throw new Error("剧情树路线数据无效。");
+    chain.push(branch);
   }
+  chain.reverse();
+  let segments = [];
+  for (const branch of chain) {
+    if (branch.parentBranchId) {
+      const retained = [];
+      let found = false;
+      for (const segment of segments) {
+        const index = segment.snapshot ? (messageId(segment.snapshot) === branch.forkMessageId ? 0 : -1)
+          : segment.ids.indexOf(branch.forkMessageId, segment.start);
+        if (index >= segment.start && index < segment.end) {
+          if (index > segment.start) retained.push({ ...segment, end: index });
+          found = true;
+          break;
+        }
+        retained.push(segment);
+      }
+      if (!found) throw new Error("找不到这条路线的分叉点，原聊天数据未被更改。");
+      if (!branch.forkSnapshot || messageId(branch.forkSnapshot) !== branch.forkMessageId) {
+        throw new Error("剧情树缺少分叉消息快照，请先恢复聊天备份。");
+      }
+      segments = [...retained, { snapshot: branch.forkSnapshot, owner: branch, start: 0, end: 1 }];
+    }
+    if (branch.messageIds.length) segments.push({ ids: branch.messageIds, start: 0, end: branch.messageIds.length });
+  }
+  return { chain, segments, length: segments.reduce((total, segment) => total + segment.end - segment.start, 0) };
+}
 
-  const nextSeen = new Set(seen);
-  nextSeen.add(branchId);
-  const parent = branchPath(tree, branch.parentBranchId, nextSeen);
-  const forkIndex = parent.findIndex((message) => messageId(message) === branch.forkMessageId);
-  if (forkIndex < 0) throw new Error("找不到这条路线的分叉点，原聊天数据未被更改。");
-  const forkMessage = branch.forkSnapshot;
-  if (!forkMessage || messageId(forkMessage) !== branch.forkMessageId) {
-    throw new Error("剧情树缺少分叉消息快照，请先恢复聊天备份。");
+export function messageReadOptions(options = {}, length) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("消息读取范围无效。");
+  const { from = 0, to = length, fields = null } = options;
+  if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || to < from) throw new Error("消息读取范围无效。");
+  if (fields !== null && (!Array.isArray(fields) || fields.some(field => typeof field !== "string" || !field
+    || field.split(".").some(part => !part || ["__proto__", "prototype", "constructor"].includes(part))))) throw new Error("消息读取字段无效。");
+  return { from: Math.min(from, length), to: Math.min(to, length), fields,
+    roots: fields === null ? null : new Set(fields.map(field => field.split(".")[0])) };
+}
+
+function selectedFields(message, fields) {
+  if (fields === null) return message;
+  const result = {};
+  // A selected parent already includes its children, independent of caller order.
+  for (const field of fields.filter(field => !fields.some(parent => parent !== field && field.startsWith(parent + ".")))) {
+    const parts = field.split(".");
+    let source = message;
+    let present = true;
+    for (const part of parts) {
+      if (source == null || !Object.hasOwn(source, part)) { present = false; break; }
+      source = source[part];
+    }
+    if (!present) continue;
+    let target = result;
+    let container = message;
+    for (const part of parts.slice(0, -1)) {
+      container = container[part];
+      target = target[part] ??= Array.isArray(container) ? [] : {};
+    }
+    target[parts.at(-1)] = source;
   }
-  const prefix = parent.slice(0, forkIndex);
-  const path = [
-    ...prefix,
-    clone(forkMessage),
-    ...branch.messageIds.map((id) => {
-      const message = tree.messages?.[id];
-      if (!message) throw new Error("剧情树缺少消息数据，请先恢复聊天备份。");
-      return clone(message);
-    }),
-  ];
-  if (Object.hasOwn(branch, "horaeRootMeta") && path[0]) {
-    if (branch.horaeRootMeta == null) delete path[0].horae_meta;
-    else path[0].horae_meta = clone(branch.horaeRootMeta);
+  return result;
+}
+
+export function copyMessageRange(messages, options = {}) {
+  const read = messageReadOptions(options, messages.length);
+  return clone(messages.slice(read.from, read.to).map(message => selectedFields(message, read.fields)));
+}
+
+function branchPath(tree, branchId, options = {}, copyOutput = true) {
+  const route = routeSegments(tree, branchId);
+  const read = messageReadOptions(options, route.length);
+  const messages = [];
+  let floor = 0;
+  for (const segment of route.segments) {
+    const size = segment.end - segment.start;
+    const start = Math.max(0, read.from - floor);
+    const end = Math.min(size, read.to - floor);
+    for (let offset = start; offset < end; offset++) {
+      const raw = segment.snapshot ?? tree.messages?.[segment.ids[segment.start + offset]];
+      if (!raw) throw new Error("剧情树缺少消息数据，请先恢复聊天备份。");
+      const id = messageId(raw);
+      const draft = read.roots ? Object.fromEntries([...read.roots].filter(key => Object.hasOwn(raw, key)).map(key => [key, raw[key]])) : { ...raw };
+      if (!read.roots || read.roots.has("extra")) draft.extra = { ...raw.extra };
+      // Restoration reads stable IDs even when the caller did not request extra.
+      const identity = { ...draft, extra: { ...draft.extra, [MESSAGE_ID_KEY]: id } };
+      // A fork snapshot replaces the ancestor anchor after its memory restoration.
+      const layers = segment.owner ? route.chain.slice(route.chain.indexOf(segment.owner)) : route.chain;
+      for (const branch of layers) {
+        restoreAdapterFields([identity], branch, { copy: value => value, fields: read.roots });
+      }
+      if (read.roots && !read.roots.has("extra")) delete identity.extra;
+      messages.push(selectedFields(identity, read.fields));
+    }
+    floor += size;
+    if (floor >= read.to) break;
   }
-  return path;
+  // Ancestor suffixes never reach this clone; each selected result is copied once.
+  return copyOutput ? clone(messages) : messages;
+}
+
+export function readStoryBranchMessages(tree, branchId = tree?.activeBranchId, options = {}) {
+  validateTreeShape(tree, { headerOnly: true });
+  return branchPath(tree, branchId, options);
 }
 
 export function createStoryTree(messages, idFactory = createId) {
@@ -173,7 +346,7 @@ export function createStoryTree(messages, idFactory = createId) {
   });
   const snapshot = clone(messages);
   const rootId = idFactory();
-  return {
+  const tree = {
     version: 1,
     rootBranchId: rootId,
     activeBranchId: rootId,
@@ -190,9 +363,11 @@ export function createStoryTree(messages, idFactory = createId) {
       },
     },
   };
+  captureMemoryState(tree.branches[rootId], snapshot);
+  return tree;
 }
 
-function validateTreeShape(tree) {
+function validateTreeShape(tree, { headerOnly = false } = {}) {
   if (
     !tree || tree.version !== 1 ||
     typeof tree.rootBranchId !== "string" ||
@@ -203,6 +378,7 @@ function validateTreeShape(tree) {
   if (!tree.branches[tree.rootBranchId] || !tree.branches[tree.activeBranchId]) {
     throw new Error("剧情树缺少主线或当前路线。");
   }
+  if (headerOnly) return;
   for (const branch of Object.values(tree.branches)) {
     if (!Array.isArray(branch.messageIds) || typeof branch.title !== "string") {
       throw new Error("剧情树路线数据无效。");
@@ -215,13 +391,13 @@ function validateTreeShape(tree) {
 
 export function validateStoryTree(tree) {
   validateTreeShape(tree);
-  branchPath(tree, tree.activeBranchId);
+  branchPath(tree, tree.activeBranchId, {}, false);
   return true;
 }
 
 export function resolveStoryBranch(tree, branchId = tree?.activeBranchId) {
   validateTreeShape(tree);
-  if (branchId !== tree.activeBranchId) branchPath(tree, tree.activeBranchId);
+  if (branchId !== tree.activeBranchId) branchPath(tree, tree.activeBranchId, {}, false);
   return branchPath(tree, branchId);
 }
 
@@ -247,6 +423,7 @@ export function createStoryBranch(tree, forkMessageIdValue, title, idFactory = c
       && swipeVariantId(parentPath[forkIndex]) !== swipeVariantId(forkMessage))) parentBranchId = tree.activeBranchId;
   const id = idFactory();
   const next = clone(tree);
+  const prefix = activePath.slice(0, forkIndex + 1);
   const siblingCount = getStoryBranchRows(tree).filter((branch) => branch.parentBranchId === parentBranchId && branch.forkMessageId === forkMessageIdValue).length;
   const customTitle = typeof title === "string" && title.trim();
   next.branches[id] = {
@@ -256,8 +433,7 @@ export function createStoryBranch(tree, forkMessageIdValue, title, idFactory = c
     forkSwipeId: Number.isInteger(forkMessage.swipe_id) ? forkMessage.swipe_id : null,
     branchKind: "continuation",
     forkVariantId: swipeVariantId(forkMessage),
-    forkSnapshot: snapshotActiveSwipe(forkMessage),
-    horaeRootMeta: clone(activePath[0]?.horae_meta ?? null),
+    forkSnapshot: snapshotActiveSwipe(prefix[forkIndex]),
     title: customTitle ? title.trim().slice(0, 80) : `分支 ${siblingCount + 1}`,
     autoTitle: !customTitle,
     titleCustomized: Boolean(customTitle),
@@ -265,6 +441,8 @@ export function createStoryBranch(tree, forkMessageIdValue, title, idFactory = c
     messageIds: [],
   };
   next.activeBranchId = id;
+  inheritAdapterFields(tree, next, prefix);
+  captureMemoryState(next.branches[id], prefix);
   return next;
 }
 
@@ -308,6 +486,8 @@ export function createStoryBranchFromSwipe(tree, replyMessageId, swipeIndex, tit
     firstMessage.variables = [clone(reply.variables[swipeIndex] ?? {})];
   }
   firstMessage.extra = variantExtra;
+  if (!isActiveSwipe) restoreSelectedSwipeFields(reply, variantExtra, firstMessage,
+    Object.values(tree.branches[tree.activeBranchId].adapterStates ?? {}).flatMap(state => state.fields));
   firstMessage.swipe_info = [{
     send_date: isActiveSwipe ? reply.send_date : info?.send_date ?? reply.send_date,
     gen_started: isActiveSwipe ? reply.gen_started : info?.gen_started,
@@ -318,12 +498,14 @@ export function createStoryBranchFromSwipe(tree, replyMessageId, swipeIndex, tit
     if (!isActiveSwipe && info && Object.hasOwn(info, key)) firstMessage[key] = info[key];
   }
   // A different swipe cannot inherit metadata from the currently displayed reply.
-  if (!isActiveSwipe) delete firstMessage.horae_meta;
 
   next.messages[newMessageId] = firstMessage;
   branch.messageIds = [newMessageId];
   branch.originSwipeIndex = Number.isInteger(reply.swipe_id) ? reply.swipe_id : 0;
   branch.sourceSwipeIndex = swipeIndex;
+  const projection = resolveStoryBranch(next);
+  inheritAdapterFields(tree, next, projection);
+  captureMemoryState(branch, projection);
   if (!String(title ?? "").trim()) {
     const siblings = getStoryBranchRows(tree).filter((item) => item.parentBranchId === branch.parentBranchId
       && item.kind === "swipe" && item.sourceMessageId === replyMessageId).length;
@@ -382,15 +564,22 @@ export function deleteStoryBranch(tree, branchId) {
 }
 
 /** Reconcile the active linear chat projection into its graph without losing other routes. */
-export function syncActiveStoryBranch(tree, liveMessages) {
-  const expected = resolveStoryBranch(tree);
+export function syncActiveStoryBranch(tree, liveMessages, { adapters = [] } = {}) {
+  validateTreeShape(tree);
+  // This projection is only read for identity matching; clone the live input once.
+  const expected = branchPath(tree, tree.activeBranchId, {}, false);
   const expectedIds = expected.map(messageId);
   const next = {
     ...tree,
     messages: { ...tree.messages },
     branches: { ...tree.branches },
   };
-  next.branches[next.activeBranchId] = clone(tree.branches[tree.activeBranchId]);
+  next.branches[next.activeBranchId] = { ...tree.branches[tree.activeBranchId], adapterStates: { ...tree.branches[tree.activeBranchId].adapterStates } };
+  for (const branchId of Object.keys(next.branches)) {
+    if (next.branches[branchId].memoryState !== undefined) continue;
+    if (branchId !== next.activeBranchId) next.branches[branchId] = { ...next.branches[branchId] };
+    captureMemoryState(next.branches[branchId], resolveStoryBranch(tree, branchId));
+  }
   const messages = clone(liveMessages);
   const suppliedIds = new Set(messages.map(messageId).filter((id) => typeof id === "string" && id));
   const usedIds = new Set();
@@ -439,11 +628,8 @@ export function syncActiveStoryBranch(tree, liveMessages) {
   for (let index = 0; index < messages.length; index++) {
     if (active.parentBranchId && index === 0) {
       // Some extensions keep chat-wide state on the first message. Snapshot it per route.
-      active.horaeRootMeta = clone(messages[index].horae_meta ?? null);
       const sharedRoot = next.messages[ids[index]];
       next.messages[ids[index]] = { ...messages[index] };
-      if (sharedRoot?.horae_meta == null) delete next.messages[ids[index]].horae_meta;
-      else next.messages[ids[index]].horae_meta = sharedRoot.horae_meta;
       if (ids[index] === active.forkMessageId) active.forkSnapshot = clone(messages[index]);
     } else if (active.parentBranchId && ids[index] === active.forkMessageId) {
       // The fork anchor is a route-local snapshot. Swiping/editing it in this
@@ -464,6 +650,15 @@ export function syncActiveStoryBranch(tree, liveMessages) {
     active.messageIds = ids.slice(forkIndex + 1);
   }
   if (missingIds.length) validateStoryTree(next);
+  const specifications = new Map(Object.entries(active.adapterStates ?? {}).map(([id, state]) => [id, { id, messageFields: state.fields }]));
+  for (const adapter of adapters) specifications.set(adapter.id, adapter);
+  for (const adapter of specifications.values()) {
+    const previous = active.adapterStates?.[adapter.id];
+    const explicit = adapter.snapshotMode === "explicit" && previous;
+    const selected = explicit ? messages.filter(message => !Object.hasOwn(previous.messages, messageId(message))) : messages;
+    if (selected.length || !previous) captureStoryBranchAdapterState(next, active.id, selected, adapter.id, adapter.messageFields, { partial: Boolean(explicit) });
+  }
+  captureMemoryState(active, messages);
   return { tree: next, messages };
 }
 
@@ -494,7 +689,7 @@ export function getStoryBranchRows(tree) {
   const parentIndexes = new Map();
   const parentPaths = new Map();
   const parentPath = (branchId) => {
-    if (!parentPaths.has(branchId)) parentPaths.set(branchId, branchPath(tree, branchId));
+    if (!parentPaths.has(branchId)) parentPaths.set(branchId, branchPath(tree, branchId, {}, false));
     return parentPaths.get(branchId);
   };
   const forkIndex = (branch) => {

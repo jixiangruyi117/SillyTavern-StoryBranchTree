@@ -2,21 +2,35 @@ import {
   TREE_METADATA_KEY,
   activateStoryBranch,
   copyStoryMessageIdentity,
+  captureStoryBranchAdapterState,
+  adapterMetadataFieldNames,
+  captureStoryBranchAdapterMetadata,
+  restoreStoryBranchAdapterMetadata,
   createStoryBranch,
   createStoryBranchFromSwipe,
   createStoryTree,
   deleteStoryBranch,
   getStoryBranchRows,
   getStoryMessageId,
+  copyMessageRange,
+  messageReadOptions,
+  readStoryBranchMessages,
   resolveStoryBranch,
   syncActiveStoryBranch,
   validateStoryTree,
-} from "./modules/StoryTree.js?v=0.1.59";
+} from "./modules/StoryTree.js?v=0.1.68";
+import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.68";
 import { isGenerating, sendTextareaMessage, swipeState, updateSwipeCounter } from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
 
 const EXTENSION_FOLDER = "third-party/SillyTavern-StoryBranchTree";
-const state = { busy: false };
+const BRANCH_CHANGED_EVENT = "story-branch-tree:changed";
+const PUBLIC_API_KEY = "SillyTavernStoryBranchTree";
+const API_READY_EVENT = "story-branch-tree:ready";
+const routeAdapters = new Map();
+const memoryTasks = new Set();
+let memoryTaskEpoch = 0;
+const state = { busy: false, routeSwitching: false };
 const eventHandlers = [];
 let panelClickHandler = null;
 let chatClickHandler = null;
@@ -29,8 +43,14 @@ let pendingConfirmation = null;
 let renderedLayout = null;
 let compactView = true;
 let cardPointer = null;
+const activeTouchPointers = new Map();
+let pinchGesture = null;
 let suppressForkClick = null;
 let suppressEndClickBranchId = null;
+let publicApi = null;
+let activeProjection = null;
+let adapterRecoveryKey = null;
+let adapterRecoveryOwner = null;
 const view = { x: 48, y: 48, scale: 1, needsFit: true, dragging: false, pointerId: null, startX: 0, startY: 0, originX: 0, originY: 0 };
 
 function context() {
@@ -47,6 +67,278 @@ function toast(level, message) {
 
 function graphFrom(ctx) {
   return ctx?.chatMetadata?.[TREE_METADATA_KEY] ?? null;
+}
+
+function graphForApi(ctx) {
+  return activeProjection && activeProjection.chat === ctx?.chat && activeProjection.chatId === ctx?.chatId
+    ? activeProjection.tree : graphFrom(ctx);
+}
+
+function routeInfo(ctx, tree, messages = ctx?.chat) {
+  const branch = tree?.branches?.[tree.activeBranchId];
+  if (!ctx || !tree || !branch || !isSoloChat(ctx) || !Array.isArray(messages)) return null;
+  const chatId = ctx.chatId ?? null;
+  return {
+    version: 1,
+    chatId,
+    characterId: ctx.characterId ?? null,
+    rootBranchId: tree.rootBranchId,
+    branchId: branch.id,
+    parentBranchId: branch.parentBranchId ?? null,
+    title: branch.title ?? "",
+    cacheKey: JSON.stringify([chatId, branch.id]),
+    messageCount: messages.length,
+    messageIds: messages.map((message) => getStoryMessageId(message) ?? null),
+  };
+}
+
+function getActiveRouteInfo() {
+  const ctx = context();
+  return routeInfo(ctx, graphForApi(ctx));
+}
+
+function getActiveRouteKey() {
+  const ctx = context();
+  const tree = graphForApi(ctx);
+  return isSoloChat(ctx) && Array.isArray(ctx.chat) && tree?.branches?.[tree.activeBranchId]
+    ? JSON.stringify([ctx.chatId ?? null, tree.activeBranchId]) : null;
+}
+
+function getRouteMessages(branchId, options = {}) {
+  const ctx = context();
+  const tree = graphForApi(ctx);
+  if (!isSoloChat(ctx) || !tree) return null;
+  const targetBranchId = branchId ?? tree.activeBranchId;
+  if (!tree.branches?.[targetBranchId]) return null;
+  if (targetBranchId === tree.activeBranchId) return Array.isArray(ctx.chat) ? copyMessageRange(ctx.chat, options) : null;
+  return readStoryBranchMessages(tree, targetBranchId, options);
+}
+
+function isMemoryBlocked(ctx = context()) {
+  return adapterRecoveryKey !== null && adapterRecoveryKey === getActiveRouteKey();
+}
+
+function getRouteMetadata(adapterId, branchId) {
+  const adapter = routeAdapters.get(adapterId);
+  if (!adapter) throw new Error("记忆适配器未注册。");
+  const ctx = context();
+  if (!isSoloChat(ctx)) return null;
+  const tree = graphForApi(ctx);
+  const saved = tree?.branches?.[branchId ?? tree.activeBranchId]?.adapterStates?.[adapterId]?.metadata;
+  return saved === undefined ? null : structuredClone(saved);
+}
+
+function captureAdapterMetadata(ctx, tree, branchId, adapter) {
+  if (adapter.metadataFields.length) captureStoryBranchAdapterMetadata(tree, branchId, ctx.chatMetadata, adapter.id, adapter.metadataFields);
+}
+
+function captureActiveAdapterMetadata(ctx, tree) {
+  for (const adapter of routeAdapters.values()) {
+    if (adapter.snapshotMode !== "explicit" || !tree.branches[tree.activeBranchId].adapterStates?.[adapter.id]?.metadata) {
+      captureAdapterMetadata(ctx, tree, tree.activeBranchId, adapter);
+    }
+  }
+}
+
+function invalidateMemoryTasks(adapterId) {
+  if (adapterId === undefined) memoryTaskEpoch++;
+  for (const task of [...memoryTasks]) if (adapterId === undefined || task.adapterId === adapterId) task.cancel();
+}
+
+function beginMemoryTask(adapterId, options = {}) {
+  const adapter = routeAdapters.get(adapterId);
+  if (!adapter) throw new Error("记忆适配器未注册。");
+  const ctx = context();
+  const key = getActiveRouteKey();
+  if (!key || state.routeSwitching || isMemoryBlocked(ctx)) throw new Error("当前路线尚未就绪，不能启动记忆任务。");
+  const read = messageReadOptions(options, ctx.chat.length);
+  const scoped = Object.hasOwn(options, "from") || Object.hasOwn(options, "to");
+  const controller = new AbortController();
+  if (scoped && ctx.chat.slice(read.from, read.to).some(message => !getStoryMessageId(message))) throw new Error("楼层标识尚未同步，请在消息事件处理完成后启动记忆任务。");
+  let scope = { chat: ctx.chat, characterId: ctx.characterId, key, epoch: memoryTaskEpoch,
+    count: ctx.chat.length, memoryRevision: adapter.memoryRevision, sources: (scoped ? ctx.chat.slice(read.from, read.to) : []).map((message, offset) => ({
+      index: read.from + offset, messageId: getStoryMessageId(message),
+      variantId: message.extra?.story_branch_tree_variant_id ?? null,
+      swipeId: message.swipe_id ?? 0, text: message.mes,
+    })) };
+  const entry = { adapterId, cancel() { controller.abort(); scope = null; memoryTasks.delete(entry); },
+    advanceRevision() { if (scope) scope.memoryRevision = adapter.memoryRevision; } };
+  const isCurrent = () => {
+    if (!scope || controller.signal.aborted || !publicApi || state.routeSwitching || routeAdapters.get(adapterId) !== adapter) return false;
+    const current = context();
+    return current?.chat === scope.chat && current.characterId === scope.characterId
+      && getActiveRouteKey() === scope.key && memoryTaskEpoch === scope.epoch
+      && adapter.memoryRevision === scope.memoryRevision
+      && (scoped || current.chat.length === scope.count)
+      && scope.sources.every(source => {
+        const message = current.chat[source.index];
+        return message && getStoryMessageId(message) === source.messageId
+          && (message.extra?.story_branch_tree_variant_id ?? null) === source.variantId
+          && (message.swipe_id ?? 0) === source.swipeId && message.mes === source.text;
+      });
+  };
+  memoryTasks.add(entry);
+  const token = Object.freeze({ adapterId, cacheKey: key, signal: controller.signal,
+    sources: Object.freeze(scope.sources.map(({ text, ...source }) => Object.freeze(source))),
+    isCurrent, assertCurrent() { if (!isCurrent()) throw new Error("记忆任务已过期，禁止写入当前路线。"); },
+    finish: entry.cancel, cancel: entry.cancel });
+  entry.token = token;
+  return token;
+}
+
+function notifyMemoryChanged(adapterId, options = {}) {
+  const adapter = routeAdapters.get(adapterId);
+  if (!adapter) throw new Error("记忆适配器未注册。");
+  if (options.task && options.task.adapterId !== adapterId) throw new Error("任务与记忆适配器不匹配。");
+  options.task?.assertCurrent();
+  if (options.metadata !== undefined && typeof options.metadata !== "boolean") throw new Error("元数据采集选项必须是布尔值。");
+  const ctx = context();
+  const tree = graphForApi(ctx);
+  if (!isSoloChat(ctx) || !tree) throw new Error("当前路线尚未就绪，不能保存记忆变更。");
+  const read = messageReadOptions(options, ctx.chat.length);
+  if (read.from === read.to && (!adapter.metadataFields.length || options.metadata === false)) return;
+  captureStoryBranchAdapterState(tree, tree.activeBranchId, ctx.chat.slice(read.from, read.to), adapterId, adapter.messageFields, { partial: true });
+  if (options.metadata !== false) captureAdapterMetadata(ctx, tree, tree.activeBranchId, adapter);
+  adapter.memoryRevision++;
+  for (const task of [...memoryTasks]) if (task.adapterId === adapterId) {
+    if (task.token === options.task) task.advanceRevision();
+    else task.cancel();
+  }
+  storeGraph(ctx, tree);
+}
+
+function installPublicApi() {
+  if (globalThis[PUBLIC_API_KEY] && globalThis[PUBLIC_API_KEY] !== publicApi) {
+    console.warn(`[StoryBranchTree] ${PUBLIC_API_KEY} is already defined; compatibility API was not installed.`);
+    return;
+  }
+  const api = Object.freeze({
+    version: 1,
+    capabilities: Object.freeze({ rangedMessages: true, memoryTasks: true, forkHooks: true, explicitSnapshots: true, metadataSnapshots: true, routeList: true }),
+    eventName: BRANCH_CHANGED_EVENT,
+    getActiveRoute: () => publicApi === api ? getActiveRouteInfo() : null,
+    getActiveRouteKey: () => publicApi === api ? getActiveRouteKey() : null,
+    getRoutes: () => {
+      const ctx = context();
+      const tree = graphForApi(ctx);
+      return publicApi === api && isSoloChat(ctx) && tree ? Object.values(tree.branches).map(branch => ({
+        branchId: branch.id, parentBranchId: branch.parentBranchId ?? null, title: branch.title ?? "",
+      })) : null;
+    },
+    getRouteMessages: (branchId, options) => publicApi === api ? getRouteMessages(branchId, options) : null,
+    getRouteMetadata: (id, branchId) => publicApi === api ? getRouteMetadata(id, branchId) : null,
+    registerRouteAdapter: (adapter) => publicApi === api ? registerRouteAdapter(adapter) : () => {},
+    beginMemoryTask: (id, options) => { if (publicApi !== api) throw new Error("路线记忆接口已停用。"); return beginMemoryTask(id, options); },
+    notifyMemoryChanged: (id, options) => { if (publicApi !== api) throw new Error("路线记忆接口已停用。"); return notifyMemoryChanged(id, options); },
+  });
+  publicApi = api;
+  globalThis[PUBLIC_API_KEY] = publicApi;
+  globalThis.dispatchEvent?.(new CustomEvent(API_READY_EVENT, { detail: { version: 1 } }));
+}
+
+function registerRouteAdapter(adapter) {
+  if (adapter?.messageFields !== undefined && !Array.isArray(adapter.messageFields)) throw new Error("记忆字段必须是数组。");
+  if (adapter?.metadataFields !== undefined && !Array.isArray(adapter.metadataFields)) throw new Error("聊天元数据字段必须是数组。");
+  const entry = { ...adapter, messageFields: [...(adapter?.messageFields ?? [])], metadataFields: adapterMetadataFieldNames(adapter?.metadataFields ?? []) };
+  captureStoryBranchAdapterState({ branches: { validate: {} } }, "validate", [], entry.id, entry.messageFields);
+  if (routeAdapters.has(entry.id)) throw new Error("这个路线记忆适配器已注册。");
+  for (const key of ["beforeSwitch", "afterSwitch", "onSwitchAborted", "onFork"]) {
+    if (entry[key] !== undefined && typeof entry[key] !== "function") throw new Error("记忆适配钩子必须是函数。");
+  }
+  if (entry.snapshotMode !== undefined && !["automatic", "explicit"].includes(entry.snapshotMode)) throw new Error("记忆快照模式无效。");
+  if (entry.handles !== undefined && (!Array.isArray(entry.handles) || entry.handles.some(value => !["database", "timeline"].includes(value)))) throw new Error("记忆恢复能力无效。");
+  entry.handles = [...new Set(entry.handles ?? [])];
+  entry.memoryRevision = 0;
+  for (const previous of routeAdapters.values()) {
+    if (entry.handles.some(value => previous.handles.includes(value)) || entry.messageFields.some(field => previous.messageFields.includes(field))
+      || entry.metadataFields.some(field => previous.metadataFields.includes(field))) {
+      throw new Error("记忆字段或恢复能力已有适配器负责，不能重复注册。");
+    }
+  }
+  routeAdapters.set(entry.id, entry);
+  const ctx = context();
+  const tree = graphForApi(ctx);
+  const previousStates = new Map(Object.values(tree?.branches ?? {}).map(branch => [branch, {
+    present: Object.hasOwn(branch, "adapterStates"), value: branch.adapterStates,
+  }]));
+  try {
+    if (isSoloChat(ctx) && tree) {
+      initializeRegisteredAdapterStates(tree, [entry]);
+      captureStoryBranchAdapterState(tree, tree.activeBranchId, ctx.chat, entry.id, entry.messageFields);
+      captureAdapterMetadata(ctx, tree, tree.activeBranchId, entry);
+      if (!activeProjection) storeGraph(ctx, tree);
+    }
+  } catch (error) {
+    for (const [branch, saved] of previousStates) {
+      if (saved.present) branch.adapterStates = saved.value;
+      else delete branch.adapterStates;
+    }
+    invalidateMemoryTasks(entry.id);
+    routeAdapters.delete(entry.id);
+    throw error;
+  }
+  return () => {
+    if (routeAdapters.get(entry.id) !== entry) return;
+    invalidateMemoryTasks(entry.id);
+    routeAdapters.delete(entry.id);
+    if (adapterRecoveryOwner === entry.id) { adapterRecoveryKey = null; adapterRecoveryOwner = null; }
+  };
+}
+
+function initializeRegisteredAdapterStates(tree, entries = routeAdapters.values()) {
+  for (const entry of entries) {
+    for (const branchId of Object.keys(tree.branches)) {
+      if (branchId !== tree.activeBranchId && !tree.branches[branchId].adapterStates?.[entry.id]) {
+        const messages = readStoryBranchMessages(tree, branchId, { fields: ["extra.story_branch_tree_message_id", ...entry.messageFields] });
+        captureStoryBranchAdapterState(tree, branchId, messages, entry.id, entry.messageFields, { copy: value => value });
+      }
+    }
+  }
+}
+
+function removePublicApi() {
+  invalidateMemoryTasks();
+  if (publicApi && globalThis[PUBLIC_API_KEY] === publicApi) delete globalThis[PUBLIC_API_KEY];
+  publicApi = null;
+  routeAdapters.clear();
+  adapterRecoveryKey = null;
+  adapterRecoveryOwner = null;
+}
+
+function branchTransitionInfo(ctx, previousBranchId, tree, messages) {
+  if (!previousBranchId || previousBranchId === tree?.activeBranchId) return null;
+  const info = routeInfo(ctx, tree, messages);
+  if (!info) return null;
+  const transitionId = globalThis.crypto?.randomUUID?.()
+    ?? `branch-change-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return {
+    ...info,
+    previousBranchId,
+    transitionId,
+    reason: "route-switched",
+    ...(!graphFrom(ctx)?.branches?.[tree.activeBranchId] ? { fork: forkBoundary(ctx, tree, messages) } : {}),
+  };
+}
+
+function forkBoundary(ctx, tree, messages) {
+  const branch = tree.branches[tree.activeBranchId];
+  const inheritedMessageCount = messages.length - branch.messageIds.length;
+  return { kind: branch.branchKind ?? "continuation", parentBranchId: branch.parentBranchId,
+    parentCacheKey: JSON.stringify([ctx.chatId ?? null, branch.parentBranchId]),
+    sourceBranchId: graphFrom(ctx)?.activeBranchId ?? null,
+    sourceCacheKey: getActiveRouteKey(),
+    forkMessageId: branch.forkMessageId, forkFloor: inheritedMessageCount, inheritedMessageCount,
+    sourceMessageId: branch.sourceMessageId ?? branch.forkMessageId,
+    sourceVariantId: branch.sourceVariantId ?? branch.forkVariantId ?? null,
+    sourceSwipeIndex: branch.sourceSwipeIndex ?? branch.forkSwipeId ?? null,
+    replyFloor: branch.branchKind === "swipe" ? inheritedMessageCount + 1 : null };
+}
+
+function emitBranchChanged(detail) {
+  if (!detail || !publicApi) return;
+  globalThis.dispatchEvent?.(new CustomEvent(BRANCH_CHANGED_EVENT, {
+    detail,
+  }));
 }
 
 function storeGraph(ctx, tree) {
@@ -92,14 +384,13 @@ function replySelectionKey(messageId, versionId, index) {
 function sourceMessageIdForBranch(tree, branch) {
   if (branch.sourceMessageId) return branch.sourceMessageId;
   if (!Number.isInteger(branch.sourceSwipeIndex) || !branch.parentBranchId) return null;
-  const parent = resolveStoryBranch(tree, branch.parentBranchId);
+  const parent = readStoryBranchMessages(tree, branch.parentBranchId, { fields: ["extra.story_branch_tree_message_id"] });
   const anchorIndex = parent.findIndex((message) => getStoryMessageId(message) === branch.forkMessageId);
   return getStoryMessageId(parent[anchorIndex + 1]) ?? null;
 }
 
 function historicalReplySource(tree, floorIndex) {
-  const route = resolveStoryBranch(tree);
-  const visible = route[floorIndex];
+  const visible = readRouteFloor(tree, tree.activeBranchId, floorIndex);
   const visibleId = getStoryMessageId(visible);
   if (!visible || !visibleId) return null;
   const ancestry = [];
@@ -110,7 +401,7 @@ function historicalReplySource(tree, floorIndex) {
     && branch.messageIds[0] === visibleId && sourceMessageIdForBranch(tree, branch));
   if (alias) {
     const sourceId = sourceMessageIdForBranch(tree, alias);
-    const source = resolveStoryBranch(tree, alias.parentBranchId)[floorIndex];
+    const source = readRouteFloor(tree, alias.parentBranchId, floorIndex);
     if (getStoryMessageId(source) !== sourceId) return null;
     const versionIndex = alias.sourceVariantId
       ? source.swipe_info?.findIndex((info) => info?.extra?.story_branch_tree_variant_id === alias.sourceVariantId) : -1;
@@ -120,7 +411,7 @@ function historicalReplySource(tree, floorIndex) {
   let ownerId = tree.activeBranchId;
   for (const branch of ancestry) {
     if (!branch.messageIds.includes(visibleId)) continue;
-    const ownerMessage = resolveStoryBranch(tree, branch.id)[floorIndex];
+    const ownerMessage = readRouteFloor(tree, branch.id, floorIndex);
     if (ownerMessage?.mes === visible.mes
       && (!replyVersionId(ownerMessage, ownerMessage.swipe_id)
         || replyVersionId(ownerMessage, ownerMessage.swipe_id) === replyVersionId(visible, visible.swipe_id))) ownerId = branch.id;
@@ -131,8 +422,7 @@ function historicalReplySource(tree, floorIndex) {
 
 function routeUsesReply(tree, branchId, sourceId, floorIndex, versionId, versionIndex) {
   if (!tree.branches[branchId]) return false;
-  const route = resolveStoryBranch(tree, branchId);
-  const message = route[floorIndex];
+  const message = readRouteFloor(tree, branchId, floorIndex);
   if (!message) return false;
   if (getStoryMessageId(message) === sourceId) {
     return versionId ? replyVersionId(message, message.swipe_id) === versionId : message.swipe_id === versionIndex;
@@ -147,7 +437,7 @@ function routeUsesReply(tree, branchId, sourceId, floorIndex, versionId, version
 
 function branchMessageIndex(tree, branch) {
   if (!branch.parentBranchId) return null;
-  const parent = resolveStoryBranch(tree, branch.parentBranchId);
+  const parent = readStoryBranchMessages(tree, branch.parentBranchId, { fields: ["extra.story_branch_tree_message_id"] });
   return parent.findIndex((message) => getStoryMessageId(message) === branch.forkMessageId);
 }
 
@@ -192,8 +482,13 @@ function sortForkPointsByFloor(groups) {
     || a.id.localeCompare(b.id));
 }
 
+function readRouteFloor(tree, branchId, index) {
+  if (!Number.isSafeInteger(index) || index < 0) return undefined;
+  return readStoryBranchMessages(tree, branchId, { from: index, to: index + 1 })[0];
+}
+
 function forkPointMessage(tree, group) {
-  if (group.kind === "swipe") return resolveStoryBranch(tree, group.parentBranchId)[group.forkIndex]
+  if (group.kind === "swipe") return readRouteFloor(tree, group.parentBranchId, group.forkIndex)
     ?? tree.messages[group.sourceMessageId];
   return group.children[0]?.forkSnapshot ?? tree.messages[group.forkMessageId];
 }
@@ -524,7 +819,7 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
       : `data-leaf-branch-id="${escapeAttribute(route.leafBranchId)}"`;
     return `<g class="story-branch-tree__compact-route" data-action="edit-branch-note" data-branch-id="${escapeAttribute(branch.id)}" data-kind="${branch.kind}" ${targetAttributes}>
       <path class="story-branch-tree__edge story-branch-tree__compact-edge" d="${path}" />
-      <path class="story-branch-tree__compact-hit-area" d="${path}" />
+      <path class="story-branch-tree__compact-hit-area" d="${path}" vector-effect="non-scaling-stroke" />
       <g class="story-branch-tree__compact-label-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branch.id)}" role="button" tabindex="0" aria-current="${branch.id === tree.activeBranchId}" aria-label="切换到路线 ${escapeAttribute(branch.branchNumber)}：${escapeAttribute(fullName)}"><rect class="story-branch-tree__compact-label-bg" x="${labelX}" y="${labelY}" width="${labelWidth}" height="24" rx="8" /><text class="story-branch-tree__compact-label" x="${labelCenterX}" y="${labelY + 12}">${escapeHtml(label)}</text></g>
       <title>${escapeHtml(`${fullName}；点击路线名可切换，点击线条查看详情，触屏长按线条拖动`)}</title>
     </g>`;
@@ -687,7 +982,7 @@ function renderTree() {
         : "主线";
       return `<article class="story-branch-tree__card${narrow ? " is-narrow" : ""}" data-branch-id="${escapeAttribute(branch.id)}" data-kind="${branch.kind}" style="left:${position.x}px;top:${position.y}px;width:${position.width}px" aria-current="${active}">
         <div class="story-branch-tree__card-heading">
-          <button class="story-branch-tree__route-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branch.id)}" type="button" ${active || disabled ? "disabled" : ""} title="切换到路线 ${escapeAttribute(branch.branchNumber)}：${escapeAttribute(branch.title)}"><span class="story-branch-tree__route-number">${branch.kind === "swipe" ? "重说" : "路线"} ${escapeHtml(branch.branchNumber)}</span> ${escapeHtml(branch.title)}</button>
+          <button class="story-branch-tree__route-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branch.id)}" type="button" ${(active && !isMemoryBlocked(ctx)) || disabled ? "disabled" : ""} title="切换到路线 ${escapeAttribute(branch.branchNumber)}：${escapeAttribute(branch.title)}"><span class="story-branch-tree__route-number">${branch.kind === "swipe" ? "重说" : "路线"} ${escapeHtml(branch.branchNumber)}</span> ${escapeHtml(branch.title)}</button>
           ${branch.parentBranchId ? `<button class="story-branch-tree__note-button" data-action="edit-branch-note" data-branch-id="${escapeAttribute(branch.id)}" type="button" ${disabled ? "disabled" : ""}>分支详情</button>` : ""}
         </div>
         <div class="story-branch-tree__route-fork">${branch.kind === "swipe" ? "回复组" : "分叉点"}：${escapeHtml(forkPointName)}</div>
@@ -743,7 +1038,7 @@ function applyView() {
   const world = document.querySelector('#story-branch-tree [data-role="world"]');
   const level = document.querySelector('#story-branch-tree [data-role="zoom-level"]');
   if (world) world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
-  if (level) level.textContent = `${Math.round(view.scale * 100)}%`;
+  if (level) level.textContent = `${view.scale < 0.01 ? Number((view.scale * 100).toPrecision(2)) : Math.round(view.scale * 100)}%`;
 }
 
 function fitView() {
@@ -757,13 +1052,13 @@ function fitView() {
   const worldWidth = Math.max(1, worldRight - minX);
   const worldBottom = layout?.maxY || Number.parseFloat(world.style.height) || canvas.clientHeight;
   const worldHeight = Math.max(1, worldBottom - minY);
-  const heightFit = layout?.compact ? (canvas.clientHeight - 40) / worldHeight : 1;
+  const heightFit = Math.max(1, canvas.clientHeight - 40) / worldHeight;
   if (canvas.clientWidth < 700) {
-    view.scale = Math.max(0.32, Math.min(0.85, (canvas.clientWidth - 32) / worldWidth, heightFit));
+    view.scale = clampViewScale(Math.min(0.85, Math.max(1, canvas.clientWidth - 32) / worldWidth, heightFit));
     view.x = (canvas.clientWidth - worldWidth * view.scale) / 2 - minX * view.scale;
     view.y = 20 - minY * view.scale;
   } else {
-    view.scale = Math.max(0.32, Math.min(1, (canvas.clientWidth - 64) / worldWidth, heightFit));
+    view.scale = clampViewScale(Math.min(1, Math.max(1, canvas.clientWidth - 64) / worldWidth, heightFit));
     view.x = (canvas.clientWidth - worldWidth * view.scale) / 2 - minX * view.scale;
     view.y = 24 - minY * view.scale;
   }
@@ -809,17 +1104,64 @@ function focusCurrentBranch() {
   applyView();
 }
 
+function clampViewScale(nextScale) {
+  // Keep transforms finite; this range also fits trees far larger than the viewport.
+  return Number.isFinite(nextScale) ? Math.max(0.000001, Math.min(64, nextScale)) : view.scale;
+}
+
 function zoomAt(nextScale, clientX, clientY) {
   const canvas = document.querySelector('#story-branch-tree [data-role="canvas"]');
   if (!canvas) return;
   const bounds = canvas.getBoundingClientRect();
-  const px = clientX - bounds.left;
-  const py = clientY - bounds.top;
+  const px = clientX === undefined ? canvas.clientWidth / 2 : clientX - bounds.left;
+  const py = clientY === undefined ? canvas.clientHeight / 2 : clientY - bounds.top;
   const worldX = (px - view.x) / view.scale;
   const worldY = (py - view.y) / view.scale;
-  view.scale = Math.max(0.3, Math.min(2.5, nextScale));
+  view.scale = clampViewScale(nextScale);
   view.x = px - worldX * view.scale;
   view.y = py - worldY * view.scale;
+  applyView();
+}
+
+function startPinchGesture(canvas) {
+  const points = [...activeTouchPointers.entries()].slice(0, 2);
+  if (points.length < 2) return false;
+  const [[firstId, first], [secondId, second]] = points;
+  const bounds = canvas.getBoundingClientRect();
+  const midpointX = (first.x + second.x) / 2 - bounds.left;
+  const midpointY = (first.y + second.y) / 2 - bounds.top;
+  pinchGesture = {
+    pointerIds: [firstId, secondId],
+    startDistance: Math.max(1, Math.hypot(second.x - first.x, second.y - first.y)),
+    startScale: view.scale,
+    worldX: (midpointX - view.x) / view.scale,
+    worldY: (midpointY - view.y) / view.scale,
+  };
+  if (cardPointer) {
+    clearTimeout(cardPointer.timer);
+    cardPointer.moved = true;
+    if (cardPointer.kind === "compact-tail" || cardPointer.kind === "ending") cardPointer.mode = "ending";
+    else if (cardPointer.kind === "compact-route") cardPointer.mode = "compact-route";
+    else if (cardPointer.kind === "fork" || cardPointer.kind === "compact-fork") cardPointer.mode = "fork";
+    else cardPointer.mode = "card";
+  }
+  view.dragging = false;
+  view.pointerId = null;
+  canvas.classList.remove("is-dragging");
+  return true;
+}
+
+function updatePinchGesture(canvas) {
+  if (!pinchGesture) return;
+  const [first, second] = pinchGesture.pointerIds.map((id) => activeTouchPointers.get(id));
+  if (!first || !second) return;
+  const bounds = canvas.getBoundingClientRect();
+  const midpointX = (first.x + second.x) / 2 - bounds.left;
+  const midpointY = (first.y + second.y) / 2 - bounds.top;
+  const distance = Math.hypot(second.x - first.x, second.y - first.y);
+  view.scale = clampViewScale(pinchGesture.startScale * distance / pinchGesture.startDistance);
+  view.x = midpointX - pinchGesture.worldX * view.scale;
+  view.y = midpointY - pinchGesture.worldY * view.scale;
   applyView();
 }
 
@@ -884,12 +1226,15 @@ function openBranchSwitchConfirm(branchId) {
   validateStoryTree(tree);
   const branch = tree.branches[branchId];
   if (!branch) throw new Error("剧情路线不存在。");
-  if (branchId === tree.activeBranchId) {
+  if (branchId === tree.activeBranchId && !isMemoryBlocked(ctx)) {
     toast("info", "当前就在这条路线。");
     return;
   }
   const row = getStoryBranchRows(tree).find((item) => item.id === branchId);
-  openConfirmation({ kind: "switch", branchId }, "切换剧情路线", `要切换到路线 ${row?.branchNumber ?? "—"}「${row?.title ?? branch.title}」吗？`, "确认切换");
+  const retry = branchId === tree.activeBranchId && isMemoryBlocked(ctx);
+  openConfirmation({ kind: "switch", branchId }, retry ? "恢复当前路线记忆" : "切换剧情路线",
+    retry ? "重新恢复当前路线的记忆和世界书注入吗？" : `要切换到路线 ${row?.branchNumber ?? "—"}「${row?.title ?? branch.title}」吗？`,
+    retry ? "重试恢复" : "确认切换");
 }
 
 function openMessageForkConfirm(messageIndex) {
@@ -1084,8 +1429,9 @@ function renderForkButtons() {
     for (let branch = tree.branches[tree.activeBranchId]; branch; branch = tree.branches[branch.parentBranchId]) {
       const sourceId = sourceMessageIdForBranch(tree, branch);
       if (!sourceId || !branch.messageIds[0]) continue;
-      const source = resolveStoryBranch(tree, branch.parentBranchId)
-        .find((message) => getStoryMessageId(message) === sourceId);
+      const ids = readStoryBranchMessages(tree, branch.parentBranchId, { fields: ["extra.story_branch_tree_message_id"] });
+      const index = ids.findIndex(message => getStoryMessageId(message) === sourceId);
+      const source = readRouteFloor(tree, branch.parentBranchId, index);
       if (source) replyAliases.set(branch.messageIds[0], { source, branch });
     }
   }
@@ -1174,7 +1520,7 @@ async function autoArrangeTree() {
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再整理剧情树。");
   const ctx = context();
   if (!isSoloChat(ctx)) throw new Error("剧情分支树仅支持单人角色聊天。");
-  const tree = syncLiveChat();
+  const tree = graphFrom(ctx);
   if (!tree) throw new Error("当前聊天还没有剧情树。");
   delete tree.layout;
   delete tree.compactLayout;
@@ -1192,9 +1538,10 @@ function soloTreeOrCreate(ctx) {
     return existing;
   }
   const tree = createStoryTree(ctx.chat);
-  const synced = syncActiveStoryBranch(tree, ctx.chat);
+  const synced = syncActiveStoryBranch(tree, ctx.chat, { adapters: routeAdapters.values() });
   applySyncedMessageIds(ctx.chat, synced.messages);
   captureActiveChatVariables(ctx, synced.tree);
+  captureActiveAdapterMetadata(ctx, synced.tree);
   storeGraph(ctx, synced.tree);
   return synced.tree;
 }
@@ -1211,25 +1558,175 @@ function syncLiveChat({ allowInitialize = false } = {}) {
   let tree = graphFrom(ctx);
   if (!tree && !allowInitialize) return null;
   tree ??= createStoryTree(ctx.chat);
-  const synced = syncActiveStoryBranch(tree, ctx.chat);
+  initializeRegisteredAdapterStates(tree);
+  const synced = syncActiveStoryBranch(tree, ctx.chat, { adapters: routeAdapters.values() });
   applySyncedMessageIds(ctx.chat, synced.messages);
   captureActiveChatVariables(ctx, synced.tree);
+  captureActiveAdapterMetadata(ctx, synced.tree);
   storeGraph(ctx, synced.tree);
   return synced.tree;
 }
 
 async function replaceActiveProjection(ctx, tree) {
+  invalidateMemoryTasks();
+  state.routeSwitching = true;
+  let change;
+  try { change = await projectRoute(ctx, tree); }
+  finally { state.routeSwitching = false; }
+  // Completed listeners may immediately begin tasks on the restored route.
+  emitBranchChanged(change);
+}
+
+async function projectRoute(ctx, tree) {
+  const chatScope = { chat: ctx.chat, chatId: ctx.chatId, characterId: ctx.characterId, groupId: ctx.groupId ?? null };
+  const sameChat = () => {
+    const current = context();
+    return current?.chat === chatScope.chat && current.chatId === chatScope.chatId
+      && current.characterId === chatScope.characterId && (current.groupId ?? null) === chatScope.groupId;
+  };
+  const assertChat = () => { if (!sameChat()) throw new Error("聊天已变化，已取消旧路线的切换。"); };
+  const previousTree = graphFrom(ctx);
+  const previousBranchId = previousTree?.activeBranchId;
   const messages = resolveStoryBranch(tree);
-  await ctx.clearChat();
-  ctx.chat.splice(0, ctx.chat.length, ...messages);
-  restoreActiveChatVariables(ctx, tree, messages);
-  await ctx.printMessages();
-  storeGraph(context(), tree);
-  await context().saveChat();
-  if (ctx.eventSource && ctx.eventTypes?.CHAT_LOADED) {
-    await ctx.eventSource.emit(ctx.eventTypes.CHAT_LOADED, {
-      detail: { id: ctx.characterId, character: ctx.characters?.[ctx.characterId] },
-    });
+  const branchChange = branchTransitionInfo(ctx, previousBranchId, tree, messages)
+    ?? (isMemoryBlocked(ctx) ? { ...routeInfo(ctx, tree, messages), previousBranchId, reason: "memory-retry" } : null);
+  const adapters = branchChange ? [...routeAdapters.values()] : [];
+  const activeMetadataFields = new Set([...routeAdapters.values()].flatMap(adapter => adapter.metadataFields));
+  const inactiveMetadata = Object.entries(tree.branches[tree.activeBranchId].adapterStates ?? {})
+    .filter(([id, saved]) => !routeAdapters.has(id) && saved.metadata
+      && !adapterMetadataFieldNames(saved.metadataFields).some(field => activeMetadataFields.has(field)));
+  const prepared = [];
+  const metadataOverrides = new Map();
+  const hookInfo = () => ({ ...structuredClone(branchChange), previousRoute: routeInfo(ctx, previousTree),
+    getMessages: options => copyMessageRange(messages, options) });
+  const acceptMetadata = (adapter, result) => {
+    if (result?.metadata === undefined) return;
+    if (!result.metadata || typeof result.metadata !== "object" || Array.isArray(result.metadata)
+      || Object.keys(result.metadata).some(field => !adapter.metadataFields.includes(field))) throw new Error("记忆钩子返回了未声明的聊天元数据。");
+    metadataOverrides.set(adapter.id, result.metadata);
+  };
+  try {
+    for (const adapter of adapters) {
+      acceptMetadata(adapter, await adapter.beforeSwitch?.(hookInfo()));
+      assertChat();
+      prepared.push(adapter);
+      if (branchChange.fork) {
+        acceptMetadata(adapter, await adapter.onFork?.(hookInfo()));
+        assertChat();
+      }
+    }
+  } catch (error) {
+    for (const adapter of sameChat() ? prepared.reverse() : []) {
+      try { await adapter.onSwitchAborted?.(routeInfo(ctx, previousTree)); }
+      catch (restoreError) { console.error("[StoryBranchTree] Memory adapter could not restore the previous route", restoreError); }
+    }
+    throw error;
+  }
+  const previousMessages = ctx.chat.slice();
+  const previousVariables = ctx.chatMetadata?.variables;
+  const previousMetadata = { branches: { previous: {} } };
+  // Rendering hooks can query the API before the new tree is persisted.
+  const projection = { chat: ctx.chat, chatId: ctx.chatId, tree };
+  let stored = false;
+  let recoveryOwner = null;
+  try {
+    assertChat();
+    for (const adapter of adapters) {
+      if (tree.branches[previousBranchId]) {
+        captureStoryBranchAdapterState(tree, previousBranchId, ctx.chat, adapter.id, adapter.messageFields);
+        captureAdapterMetadata(ctx, tree, previousBranchId, adapter);
+        previousMetadata.branches.previous.adapterStates = { ...previousMetadata.branches.previous.adapterStates,
+          [adapter.id]: tree.branches[previousBranchId].adapterStates[adapter.id] };
+      } else {
+        captureAdapterMetadata(ctx, previousMetadata, "previous", adapter);
+      }
+    }
+    if (tree.branches[previousBranchId]) captureMemoryState(tree.branches[previousBranchId], ctx.chat);
+    if (adapters.length && !previousTree?.branches?.[tree.activeBranchId]) {
+      // Preparation may persist pending edits. Only a newly created route inherits them;
+      // existing routes keep their own snapshots, and alternate replies keep their own fields.
+      const liveById = new Map(ctx.chat.map(message => [getStoryMessageId(message), message]));
+      const branch = tree.branches[tree.activeBranchId];
+      for (const message of messages) {
+        const source = liveById.get(getStoryMessageId(message))
+          ?? (branch.branchKind === "swipe" && branch.messageIds[0] === getStoryMessageId(message)
+            && branch.sourceSwipeIndex === branch.originSwipeIndex ? liveById.get(branch.sourceMessageId) : null);
+        if (!source) continue;
+        for (const adapter of adapters) {
+          for (const field of adapter.messageFields) {
+            if (Object.hasOwn(source, field)) message[field] = structuredClone(source[field]);
+            else delete message[field];
+          }
+        }
+      }
+      for (const adapter of adapters) {
+        captureStoryBranchAdapterState(tree, tree.activeBranchId, messages, adapter.id, adapter.messageFields);
+      }
+    }
+    if (!previousTree?.branches?.[tree.activeBranchId]) {
+      captureMemoryState(tree.branches[tree.activeBranchId], messages);
+    }
+    for (const [id, saved] of inactiveMetadata) {
+      captureStoryBranchAdapterMetadata(previousMetadata, "previous", ctx.chatMetadata, id, saved.metadataFields);
+      // Saved state still follows the route when its owning extension is disabled.
+    }
+    await ctx.clearChat();
+    assertChat();
+    ctx.chat.splice(0, ctx.chat.length, ...messages);
+    activeProjection = projection;
+    for (const [id] of inactiveMetadata) restoreStoryBranchAdapterMetadata(ctx.chatMetadata,
+      tree.branches[tree.activeBranchId].adapterStates[id]);
+    for (const adapter of adapters) {
+      if (metadataOverrides.has(adapter.id)) captureStoryBranchAdapterMetadata(tree, tree.activeBranchId, metadataOverrides.get(adapter.id), adapter.id, adapter.metadataFields);
+      restoreStoryBranchAdapterMetadata(ctx.chatMetadata, tree.branches[tree.activeBranchId].adapterStates?.[adapter.id]);
+    }
+    restoreActiveChatVariables(ctx, tree, messages);
+    await ctx.printMessages();
+    assertChat();
+    storeGraph(context(), tree);
+    stored = true;
+    await context().saveChat();
+    assertChat();
+    if (ctx.eventSource && ctx.eventTypes?.CHAT_LOADED) {
+      await ctx.eventSource.emit(ctx.eventTypes.CHAT_LOADED, {
+        detail: {
+          id: ctx.characterId,
+          character: ctx.characters?.[ctx.characterId],
+          ...(branchChange ? { storyBranchTree: structuredClone(branchChange) } : {}),
+        },
+      });
+    }
+    assertChat();
+    for (const adapter of adapters) {
+      recoveryOwner = adapter.id;
+      await adapter.afterSwitch?.(structuredClone(branchChange));
+      assertChat();
+    }
+    recoveryOwner = null;
+    adapterRecoveryKey = null;
+    adapterRecoveryOwner = null;
+    if (adapters.some(adapter => adapter.metadataFields.length)) await context().saveChat();
+    return branchChange;
+  } catch (error) {
+    if (!stored && sameChat()) {
+      ctx.chat.splice(0, ctx.chat.length, ...previousMessages);
+      ctx.updateChatMetadata({ variables: previousVariables });
+      for (const saved of Object.values(previousMetadata.branches.previous.adapterStates ?? {})) restoreStoryBranchAdapterMetadata(ctx.chatMetadata, saved);
+      if (activeProjection === projection) activeProjection = null;
+      for (const adapter of adapters) {
+        try { await adapter.onSwitchAborted?.(routeInfo(ctx, previousTree)); }
+        catch (restoreError) { console.error("[StoryBranchTree] Previous route memory could not be restored", restoreError); }
+      }
+      try { await ctx.printMessages(); }
+      catch (renderError) { console.error("[StoryBranchTree] Previous route could not be rendered", renderError); }
+    }
+    if (stored && sameChat()) {
+      adapterRecoveryKey = getActiveRouteKey();
+      adapterRecoveryOwner = recoveryOwner;
+    }
+    throw error;
+  } finally {
+    if (activeProjection === projection) activeProjection = null;
   }
 }
 
@@ -1421,7 +1918,7 @@ async function editNodeNote(branchId) {
   const nodeKey = row.nodeKey;
   const legacyKey = row.kind === "continuation" ? row.forkMessageId : null;
   const pointMessage = row.kind === "swipe"
-    ? resolveStoryBranch(tree, row.parentBranchId)[row.displayForkIndex]
+    ? readRouteFloor(tree, row.parentBranchId, row.displayForkIndex)
     : row.forkSnapshot ?? tree.messages[row.forkMessageId];
   const autoSummary = messageExcerpt(pointMessage);
   tree.nodeNotes ??= {};
@@ -1470,7 +1967,7 @@ async function returnToForkNode(branchId) {
 
 async function saveCardPosition(branchId, position) {
   const ctx = context();
-  const tree = syncLiveChat();
+  const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree?.branches[branchId]) throw new Error("保存分支位置失败：路线已不存在。");
   tree.layout ??= {};
   tree.layout[branchId] = { x: position.x, y: position.y, layoutVersion: 4 };
@@ -1480,7 +1977,7 @@ async function saveCardPosition(branchId, position) {
 
 async function saveForkPosition(forkId, position, narrow) {
   const ctx = context();
-  const tree = syncLiveChat();
+  const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree) throw new Error("保存分叉点位置失败：剧情树已不存在。");
   tree.layout ??= {};
   tree.layout[forkId] = { x: position.x, y: position.y, kind: "fork", narrow, layoutVersion: 4 };
@@ -1490,7 +1987,7 @@ async function saveForkPosition(forkId, position, narrow) {
 
 async function saveCompactPosition(kind, id, position, narrow) {
   const ctx = context();
-  const tree = syncLiveChat();
+  const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree) throw new Error("保存简略视图位置失败：剧情树已不存在。");
   tree.compactLayout ??= { points: {}, leaves: {} };
   tree.compactLayout[kind] ??= {};
@@ -1501,7 +1998,7 @@ async function saveCompactPosition(kind, id, position, narrow) {
 
 async function saveEndingPosition(branchId, position, narrow) {
   const ctx = context();
-  const tree = syncLiveChat();
+  const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree?.branches[branchId]) throw new Error("保存终点位置失败：路线已不存在。");
   tree.layout ??= {};
   tree.layout[`end:${branchId}`] = { x: position.x, y: position.y, kind: "end", narrow, layoutVersion: 4 };
@@ -1526,7 +2023,11 @@ function restoreProtectedProjection(error) {
 
 function handleMessageChanged() {
   const ctx = context();
-  if (state.busy || swipeState !== "none" || !isSoloChat(ctx) || !graphFrom(ctx)) return;
+  if (state.busy || swipeState !== "none" || !isSoloChat(ctx)) return;
+  if (!graphFrom(ctx)) {
+    renderForkButtons();
+    return;
+  }
   try {
     const tree = syncLiveChat();
     const active = tree.branches[tree.activeBranchId];
@@ -1557,6 +2058,7 @@ function repairCompletedSwipeIndices(messages) {
 }
 
 async function handleChatLoaded() {
+  if (!state.routeSwitching) invalidateMemoryTasks();
   if (state.busy || swipeState !== "none" || isGenerating()) return;
   const ctx = context();
   if (isSoloChat(ctx) && graphFrom(ctx)) {
@@ -1585,9 +2087,13 @@ function installEvents(ctx) {
   const types = ctx.eventTypes ?? ctx.event_types ?? {};
   if (!eventSource) return;
   for (const key of ["MESSAGE_SENT", "MESSAGE_RECEIVED", "MESSAGE_SWIPED", "MESSAGE_EDITED", "MESSAGE_UPDATED", "MESSAGE_SWIPE_DELETED"]) {
-    bindEvent(eventSource, types[key], handleMessageChanged);
+    bindEvent(eventSource, types[key], (...args) => {
+      if (["MESSAGE_SWIPED", "MESSAGE_EDITED", "MESSAGE_SWIPE_DELETED"].includes(key)) invalidateMemoryTasks();
+      handleMessageChanged(...args);
+    });
   }
   bindEvent(eventSource, types.MESSAGE_DELETED, () => {
+    invalidateMemoryTasks();
     if (state.busy || isGenerating()) return;
     try {
       syncLiveChat();
@@ -1634,8 +2140,8 @@ function installUi(menu, markup) {
     }
     try {
       if (button.dataset.action === "close-tree") closeTree();
-      if (button.dataset.action === "zoom-in") zoomAt(view.scale * 1.2, innerWidth / 2, innerHeight / 2);
-      if (button.dataset.action === "zoom-out") zoomAt(view.scale / 1.2, innerWidth / 2, innerHeight / 2);
+      if (button.dataset.action === "zoom-in") zoomAt(view.scale * 1.2);
+      if (button.dataset.action === "zoom-out") zoomAt(view.scale / 1.2);
       if (button.dataset.action === "zoom-reset") fitView();
       if (button.dataset.action === "focus-current") focusCurrentBranch();
       if (button.dataset.action === "auto-arrange") await autoArrangeTree();
@@ -1697,6 +2203,38 @@ function installUi(menu, markup) {
   });
   const canvas = treePanel.querySelector('[data-role="canvas"]');
   canvasPointerHandler = (event) => {
+    if (event.pointerType === "touch") {
+      if (event.type === "pointerdown") {
+        activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        if (activeTouchPointers.size >= 2) {
+          if (!pinchGesture && activeTouchPointers.size === 2) startPinchGesture(canvas);
+          if (pinchGesture) {
+            event.preventDefault();
+            try { canvas.setPointerCapture(event.pointerId); } catch {}
+            return;
+          }
+        }
+      } else if (event.type === "pointermove") {
+        if (activeTouchPointers.has(event.pointerId)) activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        if (pinchGesture?.pointerIds.includes(event.pointerId)) {
+          event.preventDefault();
+          updatePinchGesture(canvas);
+          return;
+        }
+      } else if (event.type === "pointerup" || event.type === "pointercancel") {
+        activeTouchPointers.delete(event.pointerId);
+        if (pinchGesture?.pointerIds.includes(event.pointerId)) {
+          const isDraggedPointer = cardPointer?.pointerId === event.pointerId;
+          pinchGesture = null;
+          if (!isDraggedPointer) {
+            view.dragging = false;
+            canvas.classList.remove("is-dragging");
+            if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+            return;
+          }
+        }
+      }
+    }
     if (event.type === "pointerdown") {
       const ending = event.target.closest(".story-branch-tree__compact-tail, .story-branch-tree__ending");
       if (ending) {
@@ -1732,7 +2270,8 @@ function installUi(menu, markup) {
         }
         return;
       }
-      if (event.target.closest(".story-branch-tree__compact-label-button")) return;
+      const compactLabel = event.target.closest(".story-branch-tree__compact-label-button");
+      if (compactLabel && !compactLabel.closest(".story-branch-tree__compact-route")) return;
       const compactRoute = event.target.closest(".story-branch-tree__compact-route");
       if (compactRoute && renderedLayout?.compact) {
         event.preventDefault();
@@ -1745,9 +2284,11 @@ function installUi(menu, markup) {
         cardPointer = {
           kind: "compact-route",
           routeElement: compactRoute,
+          branchId: compactRoute.dataset.branchId,
+          labelBranchId: compactLabel?.dataset.branchId,
           targetForkId,
           leafBranchId,
-          mode: event.pointerType === "touch" ? "pending-route" : "compact-route",
+          mode: event.pointerType === "touch" || compactLabel ? "pending-route" : "compact-route",
           startX: event.clientX,
           startY: event.clientY,
           originX: position.x,
@@ -1847,14 +2388,26 @@ function installUi(menu, markup) {
       if (cardPointer.mode === "pending-card" || cardPointer.mode === "pending" || cardPointer.mode === "pending-route" || cardPointer.mode === "pending-end") {
         if (Math.hypot(event.clientX - cardPointer.startX, event.clientY - cardPointer.startY) > 12) {
           clearTimeout(cardPointer.timer);
-          cardPointer.mode = "pan";
-          cardPointer.moved = true;
-          view.dragging = true;
-          view.pointerId = event.pointerId;
-          view.startX = cardPointer.startX;
-          view.startY = cardPointer.startY;
-          view.originX = view.x;
-          view.originY = view.y;
+          const dragMode = {
+            "pending-card": "card",
+            pending: "fork",
+            "pending-route": "compact-route",
+            "pending-end": "ending",
+          }[cardPointer.mode];
+          if (dragMode) {
+            cardPointer.mode = dragMode;
+            cardPointer.moved = true;
+            canvas.classList.add("is-dragging");
+          } else {
+            cardPointer.mode = "pan";
+            cardPointer.moved = true;
+            view.dragging = true;
+            view.pointerId = event.pointerId;
+            view.startX = cardPointer.startX;
+            view.startY = cardPointer.startY;
+            view.originX = view.x;
+            view.originY = view.y;
+          }
         }
       }
       if (cardPointer.mode === "ending") {
@@ -1969,6 +2522,16 @@ function installUi(menu, markup) {
             const position = renderedLayout?.positions.get(pointer.branchId);
             if (position) saveCardPosition(pointer.branchId, position).catch((error) => toast("warning", error.message));
           }
+        } else if (pointer.kind === "compact-route" && !pointer.moved && event.type === "pointerup") {
+          // Pointer capture targets the canvas on release, so the SVG label cannot
+          // rely on the browser's subsequent click to reach its route action.
+          if (pointer.labelBranchId) {
+            try { openBranchSwitchConfirm(pointer.labelBranchId); }
+            catch (error) { toast("warning", error.message); }
+          }
+          else editBranchNote(pointer.branchId).catch((error) => toast("warning", error.message));
+          suppressForkClick = pointer.routeElement;
+          window.setTimeout(() => { if (suppressForkClick === pointer.routeElement) suppressForkClick = null; }, 0);
         } else if ((pointer.kind === "fork" || pointer.kind === "compact-fork") && !pointer.moved && event.type === "pointerup") {
           editNodeNote(pointer.pointButton.dataset.branchId).catch((error) => toast("warning", error.message));
           suppressForkClick = pointer.pointButton;
@@ -2030,15 +2593,33 @@ function installUi(menu, markup) {
     }
   };
   document.addEventListener("click", chatClickHandler, true);
-  pendingSendGuard = (event) => {
+  pendingSendGuard = handlePendingSend;
+  document.addEventListener("click", pendingSendGuard, true);
+  document.addEventListener("keydown", pendingSendGuard, true);
+}
+
+function handlePendingSend(event) {
     const ctx = context();
     const branch = graphFrom(ctx)?.branches?.[graphFrom(ctx)?.activeBranchId];
-    if (!isSoloChat(ctx) || !branch?.pendingSwipe || state.busy) return;
+    if (!isSoloChat(ctx)) return;
     const clickSend = event.type === "click" && event.target.closest?.("#send_but");
     const keySend = event.type === "keydown" && event.target.id === "send_textarea"
       && event.key === "Enter" && !event.isComposing && !event.shiftKey && !event.altKey
       && (!event.ctrlKey || Boolean(event.target.value)) && shouldSendOnEnter();
     if (!clickSend && !keySend) return;
+    if (state.routeSwitching) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toast("info", "正在切换剧情路线并恢复记忆，请稍候再发送。");
+      return;
+    }
+    if (isMemoryBlocked(ctx)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toast("warning", "当前路线记忆恢复失败，请在剧情树中再次选择当前路线重试。");
+      return;
+    }
+    if (!branch?.pendingSwipe || state.busy) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     try {
@@ -2047,9 +2628,6 @@ function installUi(menu, markup) {
     } catch (error) {
       toast("warning", error.message);
     }
-  };
-  document.addEventListener("click", pendingSendGuard, true);
-  document.addEventListener("keydown", pendingSendGuard, true);
 }
 
 export async function activate() {
@@ -2065,6 +2643,7 @@ export async function activate() {
     return;
   }
   installEvents(ctx);
+  installPublicApi();
   await handleChatLoaded();
   console.info("[StoryBranchTree] Ready");
 }
@@ -2096,12 +2675,16 @@ export function disable() {
   canvasKeyHandler = null;
   clearTimeout(cardPointer?.timer);
   cardPointer = null;
+  activeTouchPointers.clear();
+  pinchGesture = null;
   suppressEndClickBranchId = null;
   renderedLayout = null;
+  removePublicApi();
   pendingNoteEditor?.finish(null);
   pendingNoteEditor = null;
   pendingConfirmation = null;
   state.busy = false;
+  state.routeSwitching = false;
   panel?.remove();
   confirmDialog?.remove();
   document.getElementById("story-branch-tree-launcher")?.remove();
