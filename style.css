@@ -25,14 +25,42 @@ body.story-branch-tree-confirm-open {
   backdrop-filter: blur(14px) saturate(0.92);
 }
 
+/* Scope the fallback palette to our panel and its separately mounted confirmation.
+   Existing node/SVG rules share these variables, so all surfaces stay consistent. */
+#story-branch-tree.is-solid,
+#story-branch-tree-confirm.is-solid {
+  --SmartThemeBodyColor: #eee9df;
+  --SmartThemeBlurTintColor: #202329;
+  --SmartThemeChatTintColor: #202329;
+  --SmartThemeQuoteColor: #dfb777;
+  color-scheme: dark;
+  color: var(--SmartThemeBodyColor);
+}
+
+#story-branch-tree.is-solid {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+#story-branch-tree.is-solid :where(*),
+#story-branch-tree-confirm.is-solid :where(*) {
+  text-shadow: none;
+}
+
+#story-branch-tree.is-solid :is(input, textarea),
+#story-branch-tree-confirm.is-solid :is(input, textarea) {
+  color: var(--SmartThemeBodyColor);
+  background: var(--SmartThemeBlurTintColor);
+  border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor) 35%, transparent);
+}
+
 #story-branch-tree[hidden] {
   display: none !important;
 }
 
 #story-branch-tree [hidden] { display: none !important; }
 #story-branch-tree:not(.is-library) [data-action="back-to-tree"],
-#story-branch-tree.is-library .story-branch-tree__toolbar button:not([data-action="back-to-tree"]),
-#story-branch-tree.is-library .story-branch-tree__zoom { display: none; }
+#story-branch-tree.is-library .story-branch-tree__toolbar button:not([data-action="back-to-tree"], [data-action="toggle-appearance"]) { display: none; }
 .story-branch-tree__mode-picker,
 .story-branch-tree__library { overflow: auto; padding: 1em; }
 .story-branch-tree__mode-picker button {
@@ -156,7 +184,13 @@ body.story-branch-tree-confirm-open {
   stroke-linejoin: round;
 }
 
-.story-branch-tree__view-short,
+.story-branch-tree__toolbar .story-branch-tree__appearance-icon text {
+  fill: currentColor;
+  stroke: none;
+  font-size: 16px;
+  font-weight: 700;
+}
+
 .story-branch-tree__toolbar .story-branch-tree__view-icon--detail,
 .story-branch-tree__toolbar [data-action="toggle-view"][aria-pressed="true"] .story-branch-tree__view-icon--compact {
   display: none;
@@ -166,32 +200,7 @@ body.story-branch-tree-confirm-open {
   display: block;
 }
 
-.story-branch-tree__zoom {
-  display: inline-flex;
-  align-items: center;
-  height: 2.1em;
-  border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 24%, transparent);
-  border-radius: 0.55em;
-  background: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 5%, transparent);
-}
-
-.story-branch-tree__zoom button {
-  min-width: 2.1em;
-  height: 100%;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  font-size: 1em;
-}
-
-.story-branch-tree__toolbar [data-role="zoom-level"] {
-  min-width: 3.3em;
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-  font-size: 0.82em;
-}
-
-.story-branch-tree__toolbar [data-action="toggle-view"][aria-pressed="true"] {
+.story-branch-tree__toolbar :is([data-action="toggle-view"], [data-action="toggle-appearance"])[aria-pressed="true"] {
   border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #b9915a) 65%, transparent);
   background: color-mix(in srgb, var(--SmartThemeQuoteColor, #b9915a) 17%, transparent);
 }
@@ -1019,15 +1028,6 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
     font-size: 0.85em;
   }
 
-  .story-branch-tree__zoom {
-    height: 36px;
-  }
-
-  .story-branch-tree__zoom button {
-    min-width: 34px;
-    padding: 0;
-  }
-
   .story-branch-tree__close {
     width: 36px;
     height: 36px;
@@ -1040,23 +1040,14 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
 }
 
 @media (max-width: 450px) {
-  .story-branch-tree__toolbar [data-role="zoom-level"] {
-    min-width: 2.8em;
-  }
-
-  .story-branch-tree__toolbar button {
-    gap: 0.25em;
-  }
 
   .story-branch-tree__toolbar [data-action="focus-current"] .story-branch-tree__button-label,
   .story-branch-tree__toolbar [data-action="toggle-view"] .story-branch-tree__button-label {
     display: none;
   }
 
-  .story-branch-tree__toolbar .story-branch-tree__view-short {
-    display: inline;
-  }
 }
+
 #chat .welcomePanel .recentChat.story-branch-tree__recent-folded {
   display: none;
 }

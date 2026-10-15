@@ -1288,9 +1288,7 @@ function renderTree() {
 
 function applyView() {
   const world = document.querySelector('#story-branch-tree [data-role="world"]');
-  const level = document.querySelector('#story-branch-tree [data-role="zoom-level"]');
   if (world) world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
-  if (level) level.textContent = `${view.scale < 0.01 ? Number((view.scale * 100).toPrecision(2)) : Math.round(view.scale * 100)}%`;
 }
 
 function fitView() {
@@ -1586,11 +1584,21 @@ function updateViewToggle(button) {
   const label = compactView ? "详细视图" : "简略视图";
   const text = button.querySelector('[data-role="view-label"]');
   if (text) text.textContent = label;
-  const shortText = button.querySelector('[data-role="view-short"]');
-  if (shortText) shortText.textContent = compactView ? "详细" : "简略";
   button.setAttribute("aria-label", label);
   button.title = label;
   button.setAttribute("aria-pressed", String(compactView));
+}
+
+function updateAppearance() {
+  const solid = context()?.extensionSettings?.storyBranchTreeAppearance === "solid";
+  for (const id of ["story-branch-tree", "story-branch-tree-confirm"]) {
+    document.getElementById(id)?.classList.toggle("is-solid", solid);
+  }
+  const button = document.querySelector('#story-branch-tree [data-action="toggle-appearance"]');
+  if (button) {
+    button.setAttribute("aria-pressed", String(solid));
+    button.title = `外观：${solid ? "实心背景" : "跟随酒馆"}；点击切换为${solid ? "跟随酒馆" : "实心背景"}`;
+  }
 }
 
 function closeTree() {
@@ -2624,6 +2632,7 @@ function installUi(menu, markup) {
   const treePanel = panel ?? newPanel;
   if (launcher) menu.append(launcher);
   if (!treePanel || !launcher) return;
+  updateAppearance();
   panelClickHandler = async (event) => {
     const button = event.target.closest("[data-action]");
     if (!button) return;
@@ -2702,11 +2711,16 @@ function installUi(menu, markup) {
         closeTree();
       }
       if (button.dataset.action === "close-tree") closeTree();
-      if (button.dataset.action === "zoom-in") zoomAt(view.scale * 1.2);
-      if (button.dataset.action === "zoom-out") zoomAt(view.scale / 1.2);
       if (button.dataset.action === "zoom-reset") fitView();
       if (button.dataset.action === "focus-current") focusCurrentBranch();
       if (button.dataset.action === "auto-arrange") await autoArrangeTree();
+      if (button.dataset.action === "toggle-appearance") {
+        const ctx = context();
+        if (!ctx?.extensionSettings) throw Error("当前酒馆未提供扩展设置存储。");
+        ctx.extensionSettings.storyBranchTreeAppearance = ctx.extensionSettings.storyBranchTreeAppearance === "solid" ? "theme" : "solid";
+        updateAppearance();
+        ctx.saveSettingsDebounced?.();
+      }
       if (button.dataset.action === "toggle-view") {
         compactView = !compactView;
         updateViewToggle(button);
