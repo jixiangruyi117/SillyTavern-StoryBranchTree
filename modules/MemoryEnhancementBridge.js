@@ -1,4 +1,4 @@
-import { memoryValuesEqual } from "./MemoryState.js?v=0.1.74";
+import { memoryValuesEqual } from "./MemoryState.js?v=0.1.75";
 
 // Compatibility is deliberately limited to the inspected 2.2.19 storage contract.
 export const MEMORY_ENHANCEMENT_ID = "st-memory-enhancement-2";

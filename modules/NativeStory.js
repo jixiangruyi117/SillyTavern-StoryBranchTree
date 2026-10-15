@@ -1,5 +1,5 @@
-import { getStoryMessageId, setStoryMessageId, copyStoryMessageIdentity } from "./StoryTree.js?v=0.1.74";
-import { legacyComponent, legacyDigest, summarizeLegacy } from "./LegacyNative.js?v=0.1.74";
+import { getStoryMessageId, setStoryMessageId, copyStoryMessageIdentity } from "./StoryTree.js?v=0.1.75";
+import { legacyComponent, legacyDigest, summarizeLegacy } from "./LegacyNative.js?v=0.1.75";
 
 export const NATIVE_KEY = "story_branch_tree_native";
 export const MODE_KEY = "story_branch_tree_mode";
@@ -209,6 +209,38 @@ export class NativeStoryStorage {
     if (data?.error) throw Error(`酒馆请求失败：${String(data.error)}`);
     return data;
   }
+  async chatFiles(owner, { metadata = false, check = () => this.assertOwner(owner), onProgress = () => {} } = {}) {
+    const data = await this.request("/api/characters/chats", { avatar_url: owner.avatar, ...(metadata ? { metadata: true } : {}) }, owner);
+    check();
+    const files = Object.values(data ?? {}).filter(file => typeof file.file_name === "string");
+    if (!metadata) return files;
+    const missing = files.filter(file => !file.chat_metadata || typeof file.chat_metadata !== "object" || Array.isArray(file.chat_metadata));
+    if (!missing.length) return files;
+    // TT's compatible list omits metadata even when requested. Use its public
+    // header API; never download every chat body just to discover relationships.
+    const api = globalThis.__TAURITAVERN__?.api?.chat;
+    if (typeof api?.open !== "function" || typeof api?.current?.ref !== "function") {
+      throw Error("酒馆聊天列表未提供来源信息，也没有可用的轻量元数据接口，暂不能查找或重建分组。");
+    }
+    const ref = api.current.ref();
+    if (ref?.kind !== "character" || !ref.characterId || nameOf(ref.fileName) !== owner.chatName) throw Error("当前聊天身份已改变，请重新查找。");
+    for (let start = 0; start < missing.length; start += 4) {
+      check();
+      await Promise.all(missing.slice(start, start + 4).map(async file => {
+        const handle = api.open({ ...ref, fileName: nameOf(file.file_name) });
+        if (typeof handle?.metadata?.get !== "function") throw Error("TT 酒馆未提供聊天元数据读取接口，请检查版本。");
+        const value = await handle.metadata.get();
+        check();
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw Error(`聊天「${nameOf(file.file_name)}」的来源信息读取失败。`);
+        // Retain only association fields, not every chat's table pools or story text.
+        file.chat_metadata = { main_chat: value.main_chat, [NATIVE_KEY]: value[NATIVE_KEY],
+          [MODE_KEY]: value[MODE_KEY], story_branch_tree: value.story_branch_tree ? true : undefined };
+      }));
+      check();
+      onProgress(`已读取 ${Math.min(start + 4, missing.length)} / ${missing.length} 条聊天的来源信息`);
+    }
+    return files;
+  }
   async read(chatName, owner = this.owner()) {
     const data = await this.request("/api/chats/get", { ch_name: owner.name, avatar_url: owner.avatar, file_name: nameOf(chatName) }, owner);
     if (!Array.isArray(data) || !data.length || !data[0]?.chat_metadata) throw Error(`无法读取聊天「${chatName}」。`);
@@ -376,9 +408,7 @@ export class NativeStoryStorage {
   }
   async listStories({ rebuild = false } = {}) {
     const owner = this.owner();
-    const data = await this.request("/api/characters/chats", { avatar_url: owner.avatar, ...(rebuild ? { metadata: true } : {}) }, owner);
-    this.assertOwner(owner);
-    const files = Object.values(data ?? {}).filter(file => typeof file.file_name === "string");
+    const files = await this.chatFiles(owner, { metadata: rebuild });
     const catalog = this.catalog();
     if (rebuild) {
       const candidates = new Map();
@@ -418,8 +448,7 @@ export class NativeStoryStorage {
     check();
     const liveDigest = await legacyDigest({ chat: owner.ctx.chat, metadata: owner.ctx.chatMetadata }); check();
     onProgress("正在查找当前角色的来源关联…");
-    const files = Object.values(await this.request("/api/characters/chats", { avatar_url: owner.avatar, metadata: true }, owner));
-    check();
+    const files = await this.chatFiles(owner, { metadata: true, check, onProgress });
     const component = legacyComponent(files, owner.chatName, NATIVE_KEY, validMetadata);
     if (!component.files.some(item => item.name === owner.chatName)) throw Error("当前聊天不在列表中，请保存后重新查找。");
     const existingStories = new Set(component.files.map(item => item.file.chat_metadata?.[NATIVE_KEY])
@@ -467,7 +496,8 @@ export class NativeStoryStorage {
       row.checkpoint = Boolean(parent?.checkpoints.has(row.chatName) && !floors.length);
       row.missingParent = Boolean(row.parentName && !details.has(row.parentName));
     }
-    if (rows.find(row => row.chatName === owner.chatName)?.blocked) throw Error("当前聊天的来源或数据有冲突，不能整理。请查看原始记录。");
+    const currentRow = rows.find(row => row.chatName === owner.chatName);
+    if (currentRow?.blocked) throw Error(`当前聊天暂不能整理（${currentRow.blocked}）。未修改聊天。`);
     const native = [...details.values()].map(item => item.metadata[NATIVE_KEY]).find(validMetadata);
     const plan = Object.freeze({ rows: Object.freeze(rows.map(row => Object.freeze(row))), missing: Object.freeze(component.missing),
       title: native?.storyTitle ?? component.missing[0] ?? rows.find(row => !row.parentName)?.chatName ?? owner.chatName });

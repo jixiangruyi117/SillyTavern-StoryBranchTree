@@ -75,6 +75,107 @@ async function oldFamily(t, { missing = false, unknown = false } = {}) {
   return f;
 }
 
+for (const linked of [true, false]) test(`first-floor native branches can be adopted with parent link ${linked}`, async t => {
+  const f = setup(t);
+  const first = { mes: "只有一楼的开场白", is_user: false, extra: { Foreign: { keep: 1 } }, hash_sheets: { s: [["cell"]] } };
+  f.files.set("main", [{ chat_metadata: { integrity: "root" } }, structuredClone(first)]);
+  f.files.set("child", [{ chat_metadata: { integrity: "root", main_chat: "main" } }, structuredClone(first)]);
+  if (linked) f.files.get("main")[1].extra.branches = ["child"];
+  await f.ctx.openCharacterChat("child");
+  const before = structuredClone(f.files);
+  const plan = await f.storage.discoverLegacyStory();
+  assert.equal(plan.rows.length, 2);
+  assert.ok(plan.rows.every(row => !row.blocked && row.messageCount === 1));
+  assert.equal(plan.rows.find(row => row.chatName === "child").floor, linked ? 1 : null);
+  assert.deepEqual(f.files, before);
+  await f.storage.adoptLegacyStory(plan, ["main", "child"]);
+  for (const name of ["main", "child"]) {
+    assert.equal(f.files.get(name).length, 2);
+    assert.equal(f.files.get(name)[1].mes, first.mes);
+    assert.deepEqual(f.files.get(name)[1].extra.Foreign, first.extra.Foreign);
+    assert.deepEqual(f.files.get(name)[1].hash_sheets, first.hash_sheets);
+  }
+  assert.equal(f.files.get("child")[0].chat_metadata[NATIVE_KEY].route.legacyForkUnknown, !linked);
+});
+
+test("a blocked current chat reports the actual read failure without changing files", async t => {
+  const f = await oldFamily(t);
+  f.files.get("child")[1].mes = null;
+  const before = structuredClone(f.files);
+  await assert.rejects(f.storage.discoverLegacyStory(), /当前聊天暂不能整理.*消息格式无效/);
+  assert.deepEqual(f.files, before);
+  assert.equal(f.calls.filter(call => call.path === "/api/chats/save").length, 0);
+});
+
+function useTtChatList(f, t, { beforeHeader = async () => {} } = {}) {
+  const fetch = globalThis.fetch, previous = Object.getOwnPropertyDescriptor(globalThis, "__TAURITAVERN__");
+  let headers = 0, active = 0, maximum = 0;
+  globalThis.fetch = async (path, options) => {
+    const response = await fetch(path, options);
+    if (path !== "/api/characters/chats") return response;
+    return { ...response, json: async () => (await response.json()).map(({ chat_metadata, ...file }) => file) };
+  };
+  globalThis.__TAURITAVERN__ = { api: { chat: {
+    current: { ref: () => ({ kind: "character", characterId: "fixture", fileName: f.ctx.chatId }) },
+    open(ref) {
+      assert.equal(ref.characterId, "fixture");
+      return { metadata: { async get() {
+        headers++; active++; maximum = Math.max(maximum, active);
+        try { await beforeHeader(); return structuredClone(f.files.get(ref.fileName)?.[0].chat_metadata); }
+        finally { active--; }
+      } } };
+    },
+  } } };
+  t.after(() => { globalThis.fetch = fetch; if (previous) Object.defineProperty(globalThis, "__TAURITAVERN__", previous); else delete globalThis.__TAURITAVERN__; });
+  return { count: () => headers, maximum: () => maximum };
+}
+
+test("TT lists without metadata discover relatives using bounded header reads, never unrelated bodies", async t => {
+  const f = await oldFamily(t);
+  const tt = useTtChatList(f, t);
+  const before = structuredClone(f.files);
+  const plan = await f.storage.discoverLegacyStory();
+  assert.equal(plan.rows.length, 4);
+  assert.ok(plan.rows.every(row => !row.blocked));
+  assert.equal(tt.count(), 5);
+  assert.ok(tt.maximum() <= 4);
+  assert.equal(f.calls.filter(call => call.path === "/api/chats/get").length, 4);
+  assert.deepEqual(f.files, before);
+  await f.storage.adoptLegacyStory(plan, plan.rows.map(row => row.chatName));
+  f.ctx.extensionSettings.storyBranchTreeCatalog = { version: 1, characters: {} };
+  const headerCount = tt.count();
+  await f.storage.listStories();
+  assert.equal(tt.count(), headerCount, "normal lists do not scan headers");
+  const groups = await f.storage.listStories({ rebuild: true });
+  assert.equal(tt.count(), headerCount + 5);
+  assert.ok(groups.some(story => story.storyId && story.routes.length === 4));
+});
+
+test("TT header scans honor cancellation before any writes", async t => {
+  const f = await oldFamily(t);
+  const controller = new AbortController();
+  useTtChatList(f, t, { beforeHeader: async () => controller.abort() });
+  await assert.rejects(f.storage.discoverLegacyStory({ signal: controller.signal }), /取消/);
+  assert.equal(f.calls.filter(call => call.path === "/api/chats/get").length, 0);
+  assert.equal(f.calls.filter(call => call.path === "/api/chats/save").length, 0);
+});
+
+test("changing chats during TT header discovery cannot continue the old operation", async t => {
+  const f = await oldFamily(t);
+  useTtChatList(f, t, { beforeHeader: async () => { f.ctx.chatId = "different"; } });
+  await assert.rejects(f.storage.discoverLegacyStory(), /聊天已改变/);
+  assert.equal(f.calls.filter(call => call.path === "/api/chats/get").length, 0);
+  assert.equal(f.calls.filter(call => call.path === "/api/chats/save").length, 0);
+});
+
+test("missing list metadata without a host header API reports the capability instead of a false conflict", async t => {
+  const f = await oldFamily(t);
+  useTtChatList(f, t);
+  globalThis.__TAURITAVERN__ = {};
+  await assert.rejects(f.storage.discoverLegacyStory(), /未提供来源信息/);
+  assert.equal(f.calls.filter(call => call.path === "/api/chats/get").length, 0);
+});
+
 test("old branches are discovered from a child without reading unrelated chats; adoption preserves foreign data", async t => {
   const f = await oldFamily(t);
   const before = structuredClone(f.files);

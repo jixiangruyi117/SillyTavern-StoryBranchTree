@@ -21,11 +21,12 @@ import {
   resolveStoryBranch,
   syncActiveStoryBranch,
   validateStoryTree as validateSingleStoryTree,
-} from "./modules/StoryTree.js?v=0.1.74";
-import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.74";
-import { installMemoryEnhancementBridge } from "./modules/MemoryEnhancementBridge.js?v=0.1.74";
-import { createMuyooMemoryCompatibility, muyooSheetsAtMessages } from "./modules/MuyooMemory.js?v=0.1.74";
-import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.74";
+} from "./modules/StoryTree.js?v=0.1.75";
+import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.75";
+import { installMemoryEnhancementBridge } from "./modules/MemoryEnhancementBridge.js?v=0.1.75";
+import { createMuyooMemoryCompatibility, muyooSheetsAtMessages } from "./modules/MuyooMemory.js?v=0.1.75";
+import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.75";
+import { installRecentStories } from "./modules/RecentStories.js?v=0.1.75";
 import { isGenerating, sendTextareaMessage, swipeState, updateSwipeCounter } from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
 
@@ -69,6 +70,7 @@ let originalListOnce = false;
 let nativePrepared = [];
 let nativeChangeOwner = null;
 let extensionEnabled = true;
+let disposeRecentStories = null;
 const singleMemoryCompatibility = createMuyooMemoryCompatibility({ getContext: context, getApi: () => publicApi,
   getPlugin: () => storyMode(context()) === "single" && !context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")
     ? globalThis.stMemoryEnhancement : null });
@@ -3187,12 +3189,16 @@ export async function activate() {
   }
   installEvents(ctx);
   installPublicApi();
+  disposeRecentStories?.();
+  disposeRecentStories = installRecentStories({ getContext: context });
   await handleChatLoaded();
   console.info("[StoryBranchTree] Ready");
 }
 
 export function disable() {
   extensionEnabled = false;
+  disposeRecentStories?.();
+  disposeRecentStories = null;
   nativeStorage.epoch++;
   for (const [source, eventName, handler] of eventHandlers.splice(0)) {
     source.removeListener(eventName, handler);

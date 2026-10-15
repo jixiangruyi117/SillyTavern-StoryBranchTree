@@ -1040,3 +1040,29 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
     display: inline;
   }
 }
+#chat .welcomePanel .recentChat.story-branch-tree__recent-folded {
+  display: none;
+}
+
+#chat .welcomePanel .welcomeHeader:has(.story-branch-tree__recent-toggle) {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+#chat .welcomePanel .recentChatsTitle:has(> .story-branch-tree__recent-toggle) {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.story-branch-tree__recent-toggle {
+  min-height: 44px;
+  width: max-content;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.story-branch-tree__recent-badge {
+  white-space: normal;
+}

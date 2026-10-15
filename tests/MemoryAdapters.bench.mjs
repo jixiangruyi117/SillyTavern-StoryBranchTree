@@ -49,7 +49,7 @@ async function workload(version, mode, size) {
     const singleUrl = dataModule((await readFile(resolve(dir, "modules/MuyooMemory.js"), "utf8"))
       .replace('importModule = path => import(path)', 'importModule = globalThis.__adapterBenchImport') + `\n// fixture ${fixtureId}`);
     let source = await readFile(resolve(dir, "index.js"), "utf8");
-    for (const name of ["StoryTree", "MemoryState", "NativeStory", "MemoryEnhancementBridge", "MuyooMemory"]) source = source.replace(
+    for (const name of ["StoryTree", "MemoryState", "NativeStory", "MemoryEnhancementBridge", "MuyooMemory", "RecentStories"]) source = source.replace(
       new RegExp('"\\./modules/' + name + '\\.js(?:\\?[^" ]*)?"'), JSON.stringify(name === "MuyooMemory" ? singleUrl : pathToFileURL(resolve(dir, "modules", name + ".js")).href));
     source = source.replace('"../../../../script.js"', JSON.stringify(dataModule("export const swipeState='none'; export const isGenerating=()=>false; export const sendTextareaMessage=()=>{}; export const updateSwipeCounter=async()=>{};")))
       .replace('"../../../RossAscends-mods.js"', JSON.stringify(dataModule("export const shouldSendOnEnter=()=>false;")));

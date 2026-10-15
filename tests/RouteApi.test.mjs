@@ -12,6 +12,7 @@ const coreStub = "data:text/javascript," + encodeURIComponent(
 );
 const enterStub = "data:text/javascript," + encodeURIComponent("export const shouldSendOnEnter = () => false;");
 const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
+  .replace(/"\.\/modules\/RecentStories\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/RecentStories.js", import.meta.url).href))
   .replace(/"\.\/modules\/MuyooMemory\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MuyooMemory.js", import.meta.url).href))
   .replace(/"\.\/modules\/MemoryEnhancementBridge\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MemoryEnhancementBridge.js", import.meta.url).href))
   .replace(/"\.\/modules\/NativeStory\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/NativeStory.js", import.meta.url).href))
