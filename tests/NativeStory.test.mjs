@@ -601,6 +601,31 @@ test("unsupported historical swipe selection stops before creating a native file
   assert.equal(files.size, 1);
 });
 
+test("old native core selects historical replies only in the newly created file", async t => {
+  const { ctx, storage, files } = setup(t, { legacySwipes: () => true });
+  await storage.initialize();
+  const fork = storage.forkCore;
+  storage.forkCore = (index) => fork(index, {});
+  const source = structuredClone(ctx.chat);
+  await storage.createBranch(1, 1);
+  assert.equal(ctx.chat.at(-1).mes, "回复 B");
+  assert.equal(ctx.chat.at(-1).swipe_id, 1);
+  assert.equal(files.get("main")[2].mes, source[1].mes);
+  assert.equal(files.get("main")[2].swipe_id, 0);
+  assert.equal(files.get("main").at(-1).mes, "A 后续");
+});
+
+test("old native core mismatches preserve the created file and never patch source content", async t => {
+  const { ctx, storage, files } = setup(t, { legacySwipes: () => true });
+  await storage.initialize();
+  const fork = storage.forkCore;
+  storage.forkCore = async index => { const name = await fork(index, {}); files.get(name)[2].mes = "外部变化"; return name; };
+  await assert.rejects(storage.createBranch(1, 1), /与原聊天不一致.*已保留/);
+  assert.equal(ctx.chatId, "main");
+  assert.equal(ctx.chat[1].mes, "回复 A");
+  assert.equal(files.get("branch-1")[2].mes, "外部变化");
+});
+
 test("last-floor swipes keep native behavior and update the association without new files", async t => {
   const { ctx, storage, files } = setup(t);
   await storage.initialize();
@@ -641,4 +666,17 @@ test("deleting a native child preserves the main file and removing a story leave
   await storage.removeStory(storyId, async () => { ctx.chatId = "fresh"; ctx.chatMetadata = {}; ctx.chat.splice(0); });
   assert.equal(files.size, 0);
   assert.equal(ctx.chatId, "fresh");
+});
+
+test("older chat deletion accepts its documented plain ok acknowledgement", async t => {
+  const { ctx, storage, files } = setup(t);
+  await storage.initialize();
+  const id = ctx.chatMetadata[NATIVE_KEY].storyId;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (path, options) => {
+    const response = await original(path, options);
+    return path === "/api/chats/delete" ? { ...response, headers: { get: () => "text/html; charset=utf-8" }, text: async () => "ok" } : response;
+  };
+  await storage.removeStory(id, async () => { ctx.chatId = "fresh"; ctx.chatMetadata = {}; });
+  assert.equal(files.size, 0);
 });

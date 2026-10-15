@@ -224,8 +224,8 @@ body.story-branch-tree-confirm-open {
   overflow: hidden;
   cursor: grab;
   touch-action: none;
-  background-color: #171717;
-  background-color: rgb(from var(--SmartThemeBlurTintColor, #171717) r g b / 1);
+  /* A translucent white theme tint must not become an opaque white canvas. */
+  background-color: var(--SmartThemeBlurTintColor, #171717);
   background-image: radial-gradient(color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 10%, transparent) 1px, transparent 1px);
   background-size: 24px 24px;
 }
@@ -782,7 +782,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   flex-direction: column;
   gap: 0.75em;
   width: min(30em, 100%);
-  max-height: 90dvh;
+  max-height: min(90dvh, calc(100dvh - 2em));
   box-sizing: border-box;
   overflow-y: auto;
   padding: 1.1em;
@@ -814,11 +814,15 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
 
 .story-branch-tree__note-editor-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 0.6em;
 }
 
 .story-branch-tree__note-editor-actions button {
+  flex: 0 0 auto;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   min-height: 2.4em;
   padding: 0.35em 0.8em;
   color: inherit;
@@ -887,7 +891,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   display: flex;
   flex-direction: column;
   width: min(42em, 100%);
-  max-height: min(80dvh, 52em);
+  max-height: min(80dvh, 52em, calc(100dvh - 2em));
   box-sizing: border-box;
   overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--SmartThemeQuoteColor, #b9915a) 55%, transparent);
@@ -898,6 +902,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
 
 .story-branch-tree__floor-detail-heading {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   gap: 1em;
@@ -925,10 +930,22 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
 }
 
 .story-branch-tree__floor-detail-content {
+  min-height: 0;
   overflow-y: auto;
   padding: 1em;
   line-height: 1.6;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.story-branch-tree__floor-detail .story-branch-tree__reply-actions {
+  min-height: 0;
+  max-height: 30dvh;
+  overflow-y: auto;
+}
+
+.story-branch-tree__reply-actions button {
+  max-width: 100%;
   overflow-wrap: anywhere;
 }
 

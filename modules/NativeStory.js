@@ -85,10 +85,11 @@ export function nativeRows(tree) {
 
 /** Native chat files own route data. Settings contain only a rebuildable catalog. */
 export class NativeStoryStorage {
-  constructor(getContext, { fork, selectSwipe, prepare, complete, aborted } = {}) {
+  constructor(getContext, { fork, selectSwipe, legacySwipes = () => false, prepare, complete, aborted } = {}) {
     this.context = getContext;
     this.forkCore = fork;
     this.selectSwipe = selectSwipe;
+    this.legacySwipes = legacySwipes;
     this.prepare = prepare;
     this.complete = complete;
     this.aborted = aborted;
@@ -205,6 +206,10 @@ export class NativeStoryStorage {
     if (owner.epoch !== this.epoch) throw Error("原生故事操作已取消。");
     const response = await fetch(path, { method: "POST", headers: owner.ctx.getRequestHeaders(), body: JSON.stringify(body) });
     if (!response.ok) throw Error(`酒馆请求失败（${response.status}）。`);
+    if (path === "/api/chats/delete" && /^text\/(?:html|plain)(?:;|$)/i.test(response.headers?.get("content-type") ?? "")) {
+      if ((await response.text()).trim() !== "ok") throw Error("酒馆删除接口返回了无法识别的结果。");
+      return {};
+    }
     const data = await response.json();
     if (data?.error) throw Error(`酒馆请求失败：${String(data.error)}`);
     return data;
@@ -313,11 +318,18 @@ export class NativeStoryStorage {
       this.syncCurrent();
       await ctx.saveChat();
       this.assertOwner(owner);
-      created = await this.forkCore(index, swipeId === null ? {} : { swipeId });
+      created = await this.forkCore(index, swipeId === null ? {} : { swipeId }, route.id);
       if (!created) throw Error("酒馆未返回新分支名称。");
       this.assertOwner(owner);
       const records = await this.read(created, owner);
       this.assertOwner(owner);
+      if (swipeId !== null && this.legacySwipes()) {
+        // Old core creates a normal native file. Select the requested reply only
+        // in that newly owned file, after checking it matches the source snapshot.
+        if (records.length !== index + 2 || records[index + 1]?.mes !== message.mes
+          || records[index + 1]?.swipe_id !== message.swipe_id) throw Error("新分支与原聊天不一致，已停止选择重说回复。");
+        records[index + 1] = structuredClone(targetMessages[index]);
+      }
       if (records.length !== index + 2 || records[index + 1]?.mes !== targetMessages[index].mes
         || (swipeId !== null && records[index + 1]?.swipe_id !== swipeId)) throw Error("当前酒馆没有正确保存指定的分叉回复，请更新酒馆后重试。");
       const childMetadata = records[0].chat_metadata;

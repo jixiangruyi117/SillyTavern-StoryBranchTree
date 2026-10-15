@@ -25,10 +25,15 @@ import {
 import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.75";
 import { installMemoryEnhancementBridge } from "./modules/MemoryEnhancementBridge.js?v=0.1.75";
 import { createMuyooMemoryCompatibility, muyooSheetsAtMessages } from "./modules/MuyooMemory.js?v=0.1.75";
-import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.75";
+import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.77";
 import { installRecentStories } from "./modules/RecentStories.js?v=0.1.75";
-import { isGenerating, sendTextareaMessage, swipeState, updateSwipeCounter } from "../../../../script.js";
+import { createHostCompatibility } from "./modules/HostCompatibility.js?v=0.1.77";
+import * as tavernCore from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
+
+const host = createHostCompatibility(tavernCore);
+const { isGenerating } = host;
+const { sendTextareaMessage, updateSwipeCounter } = tavernCore;
 
 const EXTENSION_FOLDER = "third-party/SillyTavern-StoryBranchTree";
 const BRANCH_CHANGED_EVENT = "story-branch-tree:changed";
@@ -45,6 +50,8 @@ let pendingSendGuard = null;
 let canvasPointerHandler = null;
 let canvasWheelHandler = null;
 let canvasKeyHandler = null;
+let canvasResizeObserver = null;
+let canvasResizeFrame = null;
 let pendingNoteEditor = null;
 let pendingConfirmation = null;
 let renderedLayout = null;
@@ -75,8 +82,11 @@ const singleMemoryCompatibility = createMuyooMemoryCompatibility({ getContext: c
   getPlugin: () => storyMode(context()) === "single" && !context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")
     ? globalThis.stMemoryEnhancement : null });
 const nativeStorage = new NativeStoryStorage(context, {
-  fork: async (index, options) => (await import("../../../bookmarks.js")).createBranch(index, options),
-  selectSwipe: async (message, index) => (await import("../../../../script.js")).syncSwipeToMes?.(null, index, message) ?? false,
+  fork: async (index, options, routeId) => host.legacy()
+    ? host.createLegacyBranch(index, routeId, context())
+    : (await import("../../../bookmarks.js")).createBranch(index, options),
+  selectSwipe: (message, index) => host.selectSwipe(message, index),
+  legacySwipes: host.legacy,
   prepare: prepareNativeChange,
   complete: completeNativeChange,
   aborted: abortNativeChange,
@@ -820,12 +830,12 @@ function edgeMarkup(groups, routePositions, hubPositions, endPositions, cardHeig
 function positionRouteEnds(layout) {
   const endElements = new Map([...layout.world.querySelectorAll(".story-branch-tree__ending")].map((node) => [node.dataset.branchId, node]));
   const occupied = [
-    ...layout.positions.values().map(({ x, y, width }) => ({ x, y, width, height: layout.cardHeight })),
-    ...layout.hubPositions.values().map(({ x, y, width }) => ({ x, y, width, height: layout.hubHeight })),
+    ...Array.from(layout.positions.values(), ({ x, y, width }) => ({ x, y, width, height: layout.cardHeight })),
+    ...Array.from(layout.hubPositions.values(), ({ x, y, width }) => ({ x, y, width, height: layout.hubHeight })),
   ];
   for (const [branchId, { x, y }] of layout.manualEnds) {
     const card = layout.positions.get(branchId);
-    if (card) occupied.push({ x, y, width: Math.min(280, Math.max(220, card.width - 10)), height: 104 });
+    if (card) occupied.push({ x, y, width: Math.min(280, Math.max(220, card.width - 10)), height: layout.endHeights?.get(branchId) ?? 104 });
   }
   layout.endPositions.clear();
   for (const branch of [...layout.branches].sort((a, b) => b.depth - a.depth)) {
@@ -834,6 +844,7 @@ function positionRouteEnds(layout) {
     const lastHub = groups.length ? layout.hubPositions.get(groups.at(-1).id) : null;
     if (!card) continue;
     const width = Math.min(280, Math.max(220, card.width - 10));
+    const height = layout.endHeights?.get(branch.id) ?? 104;
     const axis = lastHub ? lastHub.x + lastHub.width / 2 : card.x + card.width / 2;
     const manual = layout.manualEnds.get(branch.id);
     const x = manual?.x ?? axis - width / 2;
@@ -841,12 +852,12 @@ function positionRouteEnds(layout) {
     if (!manual) {
       while (true) {
         const conflicts = occupied.filter((node) => x < node.x + node.width + 18 && x + width + 18 > node.x
-          && y < node.y + node.height + 18 && y + 104 + 18 > node.y);
+          && y < node.y + node.height + 18 && y + height + 18 > node.y);
         if (!conflicts.length) break;
         y = Math.max(...conflicts.map((node) => node.y + node.height + 24));
       }
     }
-    const ending = { x, y, width, height: 104 };
+    const ending = { x, y, width, height };
     layout.endPositions.set(branch.id, ending);
     occupied.push(ending);
     const element = endElements.get(branch.id);
@@ -864,7 +875,7 @@ function updateLayoutBounds(layout) {
   const left = Math.min(0, ...nodes.map(({ x }) => x));
   const top = Math.min(0, ...nodes.map(({ y }) => y));
   const right = Math.max(layout.canvasWidth, ...nodes.map(({ x, width }) => x + width)) + 32;
-  const bottom = Math.max(layout.cardHeight + 32, ...layout.positions.values().map(({ y }) => y + layout.cardHeight + 32), ...layout.endPositions.values().map(({ y, height }) => y + height + 32));
+  const bottom = Math.max(layout.cardHeight + 32, ...Array.from(layout.positions.values(), ({ y }) => y + layout.cardHeight + 32), ...Array.from(layout.endPositions.values(), ({ y, height }) => y + height + 32));
   layout.minX = left;
   layout.minY = top;
   layout.maxX = right;
@@ -897,6 +908,22 @@ function messageExcerpt(message, limit = 150) {
   return characters.length > limit ? `${characters.slice(0, limit - 1).join("")}…` : text;
 }
 
+// Measure each displayed string once per render, then reuse when dragging redraws
+// the SVG. Batch reads before writes to avoid a layout flush per label.
+function fitCompactText(svg, widths) {
+  const updates = [];
+  for (const text of svg.querySelectorAll("[data-text-width]")) {
+    const limit = Number(text.getAttribute("data-text-width"));
+    const key = JSON.stringify([text.textContent, text.getAttribute("class"), text.closest("[aria-current]")?.getAttribute("aria-current")]);
+    if (!widths.has(key)) widths.set(key, text.getComputedTextLength());
+    if (widths.get(key) > limit) updates.push([text, limit]);
+  }
+  for (const [text, limit] of updates) {
+    text.setAttribute("textLength", String(limit));
+    text.setAttribute("lengthAdjust", "spacingAndGlyphs");
+  }
+}
+
 function renderCompactTree(root, tree, branches, groups, groupsByParent, branchEnds) {
   const world = root.querySelector('[data-role="world"]');
   const empty = root.querySelector('[data-role="empty"]');
@@ -920,6 +947,7 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
   const columns = planTreeColumns(roots.map(branch => branch.id), groupsByParent, 220, narrow ? 38 : 46, narrow ? 44 : 56);
   const sortedGroups = columns.groupsFor;
   const routeStarts = new Map();
+  const textWidths = new Map();
   const layoutRoute = (branchId, axis, top, depth, seen = new Set()) => {
     if (seen.has(branchId)) return top;
     const nextSeen = new Set(seen).add(branchId);
@@ -979,7 +1007,7 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
           const labelX = (x1 + x2) / 2 + 12;
           const labelY = (y1 + y2) / 2 - 12;
           const rootLabel = roots.length > 1 ? `路线 ${branch.branchNumber}` : "主线";
-          lanes.push(`<g class="story-branch-tree__compact-label-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branchId)}" role="button" tabindex="0" aria-current="${branchId === tree.activeBranchId}" aria-label="切换到${escapeAttribute(rootLabel)}"><rect class="story-branch-tree__compact-label-bg" x="${labelX}" y="${labelY}" width="70" height="24" rx="8" /><text class="story-branch-tree__compact-label" x="${labelX + 35}" y="${labelY + 12}">${escapeHtml(rootLabel)}</text><title>点击切换到${escapeHtml(rootLabel)}</title></g>`);
+          lanes.push(`<g class="story-branch-tree__compact-label-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branchId)}" role="button" tabindex="0" aria-current="${branchId === tree.activeBranchId}" aria-label="切换到${escapeAttribute(rootLabel)}"><rect class="story-branch-tree__compact-label-bg" x="${labelX}" y="${labelY}" width="70" height="24" rx="8" /><text class="story-branch-tree__compact-label" data-text-width="52" x="${labelX + 35}" y="${labelY + 12}">${escapeHtml(rootLabel)}</text><title>点击切换到${escapeHtml(rootLabel)}</title></g>`);
         }
       }
       const tail = branchEnds.get(branchId);
@@ -991,7 +1019,7 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
       const centerX = leaf.x + pointSize / 2;
       const tailWidth = 220;
       const textX = centerX - tailWidth / 2 + 13;
-      lanes.push(`<g class="story-branch-tree__compact-tail" data-action="show-end" data-branch-id="${escapeAttribute(branchId)}" role="button" tabindex="0" aria-label="查看第 ${tail?.floor ?? "—"} 楼终点内容"><circle cx="${centerX}" cy="${leaf.y + pointSize / 2}" r="5" /><rect x="${centerX - tailWidth / 2}" y="${leaf.y + 35}" width="${tailWidth}" height="70" rx="11" /><text x="${textX}" y="${leaf.y + 54}"><tspan class="story-branch-tree__compact-tail-floor">终点 · 第 ${tail?.floor ?? "—"} 楼</tspan><tspan class="story-branch-tree__compact-tail-summary" x="${textX}" dy="18">${escapeHtml(line1)}</tspan><tspan class="story-branch-tree__compact-tail-summary" x="${textX}" dy="16">${escapeHtml(line2)}</tspan></text><title>点击查看末楼内容，触屏长按拖动</title></g>`);
+      lanes.push(`<g class="story-branch-tree__compact-tail" data-action="show-end" data-branch-id="${escapeAttribute(branchId)}" role="button" tabindex="0" aria-label="查看第 ${tail?.floor ?? "—"} 楼终点内容"><circle cx="${centerX}" cy="${leaf.y + pointSize / 2}" r="5" /><rect x="${centerX - tailWidth / 2}" y="${leaf.y + 35}" width="${tailWidth}" height="70" rx="11" /><text x="${textX}" y="${leaf.y + 54}"><tspan class="story-branch-tree__compact-tail-floor" data-text-width="194">终点 · 第 ${tail?.floor ?? "—"} 楼</tspan><tspan class="story-branch-tree__compact-tail-summary" data-text-width="194" x="${textX}" dy="18">${escapeHtml(line1)}</tspan><tspan class="story-branch-tree__compact-tail-summary" data-text-width="194" x="${textX}" dy="16">${escapeHtml(line2)}</tspan></text><title>点击查看末楼内容，触屏长按拖动</title></g>`);
     }
     return lanes.join("");
   };
@@ -1021,12 +1049,12 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
     return `<g class="story-branch-tree__compact-route" data-action="edit-branch-note" data-branch-id="${escapeAttribute(branch.id)}" data-kind="${branch.kind}" ${targetAttributes}>
       <path class="story-branch-tree__edge story-branch-tree__compact-edge" d="${path}" />
       <path class="story-branch-tree__compact-hit-area" d="${path}" vector-effect="non-scaling-stroke" />
-      <g class="story-branch-tree__compact-label-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branch.id)}" role="button" tabindex="0" aria-current="${branch.id === tree.activeBranchId}" aria-label="切换到路线 ${escapeAttribute(branch.branchNumber)}：${escapeAttribute(fullName)}"><rect class="story-branch-tree__compact-label-bg" x="${labelX}" y="${labelY}" width="${labelWidth}" height="24" rx="8" /><text class="story-branch-tree__compact-label" x="${labelCenterX}" y="${labelY + 12}">${escapeHtml(label)}</text></g>
+      <g class="story-branch-tree__compact-label-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branch.id)}" role="button" tabindex="0" aria-current="${branch.id === tree.activeBranchId}" aria-label="切换到路线 ${escapeAttribute(branch.branchNumber)}：${escapeAttribute(fullName)}"><rect class="story-branch-tree__compact-label-bg" x="${labelX}" y="${labelY}" width="${labelWidth}" height="24" rx="8" /><text class="story-branch-tree__compact-label" data-text-width="${labelWidth - 18}" x="${labelCenterX}" y="${labelY + 12}">${escapeHtml(label)}</text></g>
       <title>${escapeHtml(`${fullName}；点击路线名可切换，点击线条查看详情，触屏长按线条拖动`)}</title>
     </g>`;
   }).join("");
   const allPoints = [...points.values(), ...leaves.values()];
-  const minX = Math.min(0, ...points.values().map((point) => point.x), ...leaves.values().map((point) => point.x - 82));
+  const minX = Math.min(0, ...Array.from(points.values(), (point) => point.x), ...Array.from(leaves.values(), (point) => point.x - 82));
   const minY = Math.min(0, ...allPoints.map((point) => point.y - pointSize / 2));
   const maxX = Math.max(canvas.clientWidth, ...[...points.values(), ...leaves.values()].map((point) => point.x + 220)) + 24;
   const maxY = Math.max(canvas.clientHeight, ...[...points.values()].map((point) => point.y + pointSize), ...[...leaves.values()].map((point) => point.y + 120)) + 24;
@@ -1045,17 +1073,19 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
   world.style.height = `${maxY}px`;
   world.innerHTML = `<svg class="story-branch-tree__edges is-compact" width="${maxX}" height="${maxY}" aria-label="剧情路线和终点">${rebuildEdges()}</svg>${hubs}`;
   const svg = world.querySelector(".story-branch-tree__edges");
-  renderedLayout = { compact: true, branches, groups, hubPositions: points, positions: new Map(), leaves, routes, world, narrow, compactPointSize: pointSize, minX, minY, maxX, maxY, canvasWidth: canvas.clientWidth, updateCompactEdges: () => {
+  fitCompactText(svg, textWidths);
+  renderedLayout = { compact: true, branches, groups, hubPositions: points, positions: new Map(), leaves, routes, world, narrow, compactPointSize: pointSize, minX, minY, maxX, maxY, canvasWidth: canvas.clientWidth, canvasHeight: canvas.clientHeight, updateCompactEdges: () => {
     const nodes = [...points.values(), ...leaves.values()];
-    renderedLayout.minX = Math.min(0, ...points.values().map((point) => point.x), ...leaves.values().map((point) => point.x - 82));
+    renderedLayout.minX = Math.min(0, ...Array.from(points.values(), (point) => point.x), ...Array.from(leaves.values(), (point) => point.x - 82));
     renderedLayout.minY = Math.min(0, ...nodes.map((point) => point.y - pointSize / 2));
     renderedLayout.maxX = Math.max(canvas.clientWidth, ...nodes.map((point) => point.x + 220)) + 24;
-    renderedLayout.maxY = Math.max(canvas.clientHeight, ...points.values().map((point) => point.y + pointSize), ...leaves.values().map((point) => point.y + 120)) + 24;
+    renderedLayout.maxY = Math.max(canvas.clientHeight, ...Array.from(points.values(), (point) => point.y + pointSize), ...Array.from(leaves.values(), (point) => point.y + 120)) + 24;
     world.style.width = `${renderedLayout.maxX}px`;
     world.style.height = `${renderedLayout.maxY}px`;
     svg.setAttribute("width", String(renderedLayout.maxX));
     svg.setAttribute("height", String(renderedLayout.maxY));
     svg.innerHTML = rebuildEdges();
+    fitCompactText(svg, textWidths);
   } };
   empty.hidden = true;
   if (view.needsFit) fitView();
@@ -1072,6 +1102,7 @@ function renderTree() {
   const world = root.querySelector('[data-role="world"]');
   const empty = root.querySelector('[data-role="empty"]');
   if (!isSoloChat(ctx)) {
+    renderedLayout = null;
     status.textContent = "仅支持单人角色聊天；群聊中不会修改消息或保存剧情树。";
     world.replaceChildren();
     empty.hidden = false;
@@ -1080,6 +1111,7 @@ function renderTree() {
   }
   let tree = graphFrom(ctx);
   if (!tree) {
+    renderedLayout = null;
     status.textContent = "当前聊天还没有分支。点击任意消息旁的“分支”即可开始。";
     world.replaceChildren();
     empty.hidden = false;
@@ -1118,7 +1150,7 @@ function renderTree() {
     const canvas = root.querySelector('[data-role="canvas"]');
     const narrow = canvas.clientWidth < 700;
     const cardWidth = narrow ? Math.max(220, Math.min(310, canvas.clientWidth - 24)) : 310;
-    const cardHeight = 204;
+    let cardHeight = 204;
     const hubHeight = 88;
     const rootBranch = branches.find((branch) => branch.id === tree.rootBranchId);
     if (!rootBranch) throw new Error("剧情树缺少主线。");
@@ -1149,23 +1181,26 @@ function renderTree() {
       if (lastHubY !== null) subtreeBottom = Math.max(subtreeBottom, lastHubY + hubHeight + 78 + 104);
       return subtreeBottom;
     };
-    roots.forEach((branch, index) => placeRoute(branch, rootAxis + index * (columns.leftExtent + columns.rightExtent + 100), 32));
-    for (const branch of branches) {
-      const saved = tree.layout?.[branch.id];
-      const position = positions.get(branch.id);
-      if (!narrow && position && saved?.layoutVersion === 4 && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
-        position.x = saved.x;
-        position.y = saved.y;
+    const arrangeRoutes = () => {
+      roots.forEach((branch, index) => placeRoute(branch, rootAxis + index * (columns.leftExtent + columns.rightExtent + 100), 32));
+      for (const branch of branches) {
+        const saved = tree.layout?.[branch.id];
+        const position = positions.get(branch.id);
+        if (!narrow && position && saved?.layoutVersion === 4 && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+          position.x = saved.x;
+          position.y = saved.y;
+        }
       }
-    }
-    for (const group of groups) {
-      const saved = tree.layout?.[group.id];
-      const position = hubPositions.get(group.id);
-      if (position && saved?.layoutVersion === 4 && saved.kind === "fork" && saved.narrow === narrow && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
-        position.x = saved.x;
-        position.y = saved.y;
+      for (const group of groups) {
+        const saved = tree.layout?.[group.id];
+        const position = hubPositions.get(group.id);
+        if (position && saved?.layoutVersion === 4 && saved.kind === "fork" && saved.narrow === narrow && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+          position.x = saved.x;
+          position.y = saved.y;
+        }
       }
-    }
+    };
+    arrangeRoutes();
     const maxX = Math.max(canvas.clientWidth, ...[...positions.values(), ...hubPositions.values()].map(({ x, width }) => x + width)) + 50;
     const maxY = Math.max(canvas.clientHeight, ...[...positions.values()].map(({ y }) => y + cardHeight + 30), ...[...hubPositions.values()].map(({ y }) => y + hubHeight + 30));
     const cards = branches.map((branch) => {
@@ -1220,17 +1255,30 @@ function renderTree() {
     world.style.width = `${maxX}px`;
     world.style.height = `${maxY}px`;
     world.innerHTML = `<svg class="story-branch-tree__edges" width="${maxX}" height="${maxY}" aria-hidden="true"></svg>${cards}${hubs}${endings}`;
+    const endingNodes = [...world.querySelectorAll(".story-branch-tree__ending")];
+    for (const node of endingNodes) node.style.width = `${Math.min(280, Math.max(220, cardWidth - 10))}px`;
+    const measuredHeight = Math.max(204, ...[...world.querySelectorAll(".story-branch-tree__card")].map(node => node.offsetHeight));
+    const endHeights = new Map(endingNodes.map(node => [node.dataset.branchId, Math.max(104, node.offsetHeight)]));
+    if (measuredHeight !== cardHeight) {
+      cardHeight = measuredHeight;
+      arrangeRoutes();
+      for (const node of world.querySelectorAll(".story-branch-tree__card, .story-branch-tree__fork-hub")) {
+        const point = node.dataset.forkId ? hubPositions.get(node.dataset.forkId) : positions.get(node.dataset.branchId);
+        node.style.left = `${point.x}px`; node.style.top = `${point.y}px`;
+      }
+    }
     const manualEnds = new Map(branches.flatMap((branch) => {
       const saved = tree.layout?.[`end:${branch.id}`];
       return saved?.kind === "end" && saved.layoutVersion === 4 && saved.narrow === narrow && Number.isFinite(saved.x) && Number.isFinite(saved.y)
         ? [[branch.id, { x: saved.x, y: saved.y }]] : [];
     }));
-    renderedLayout = { branches, groups, positions, hubPositions, endPositions: new Map(), manualEnds, narrow, cardHeight, hubHeight, world, canvasWidth: canvas.clientWidth };
+    renderedLayout = { branches, groups, positions, hubPositions, endPositions: new Map(), endHeights, manualEnds, narrow, cardHeight, hubHeight, world, canvasWidth: canvas.clientWidth, canvasHeight: canvas.clientHeight };
     updateLayoutBounds(renderedLayout);
     empty.hidden = true;
     if (view.needsFit) fitView();
     else applyView();
   } catch (error) {
+    renderedLayout = null;
     status.textContent = error.message;
     world.replaceChildren();
     empty.hidden = false;
@@ -2472,7 +2520,7 @@ function restoreProtectedProjection(error) {
 
 function handleMessageChanged() {
   const ctx = context();
-  if (state.busy || swipeState !== "none" || !isSoloChat(ctx)) return;
+  if (state.busy || host.isSwiping() || !isSoloChat(ctx)) return;
   if (!graphFrom(ctx)) {
     renderForkButtons();
     return;
@@ -2508,7 +2556,7 @@ function repairCompletedSwipeIndices(messages) {
 
 async function handleChatLoaded() {
   if (!state.routeSwitching) invalidateMemoryTasks();
-  if (state.busy || swipeState !== "none" || isGenerating()) return;
+  if (state.busy || host.isSwiping() || isGenerating()) return;
   await connectMemoryEnhancement();
   const ctx = context();
   if (isSoloChat(ctx) && graphFrom(ctx)) {
@@ -3076,6 +3124,20 @@ function installUi(menu, markup) {
     }
   };
   for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) canvas.addEventListener(type, canvasPointerHandler);
+  if (typeof ResizeObserver === "function") {
+    canvasResizeObserver = new ResizeObserver(() => {
+      if (treePanel.hidden || !renderedLayout || !canvas.clientWidth || !canvas.clientHeight
+        || renderedLayout.canvasWidth === canvas.clientWidth && renderedLayout.canvasHeight === canvas.clientHeight) return;
+      if (canvasResizeFrame !== null) cancelAnimationFrame(canvasResizeFrame);
+      canvasResizeFrame = requestAnimationFrame(() => {
+        canvasResizeFrame = null;
+        if (treePanel.hidden || !renderedLayout || !canvas.clientWidth || !canvas.clientHeight) return;
+        view.needsFit = true;
+        renderTree();
+      });
+    });
+    canvasResizeObserver.observe(canvas);
+  }
   canvasWheelHandler = (event) => {
     event.preventDefault();
     zoomAt(view.scale * (event.deltaY < 0 ? 1.1 : 1 / 1.1), event.clientX, event.clientY);
@@ -3197,6 +3259,10 @@ export async function activate() {
 
 export function disable() {
   extensionEnabled = false;
+  canvasResizeObserver?.disconnect();
+  canvasResizeObserver = null;
+  if (canvasResizeFrame !== null) cancelAnimationFrame(canvasResizeFrame);
+  canvasResizeFrame = null;
   disposeRecentStories?.();
   disposeRecentStories = null;
   nativeStorage.epoch++;
@@ -3256,4 +3322,8 @@ export function disable() {
     row.classList.remove("story-branch-tree__history-swipes");
     row.querySelector(".swipes-counter")?.removeAttribute("data-story-swipe-count");
   });
+}
+
+if (host.legacy() && typeof globalThis.jQuery === "function") {
+  globalThis.jQuery(() => activate().catch(error => console.error("[StoryBranchTree] Legacy activation failed", error)));
 }

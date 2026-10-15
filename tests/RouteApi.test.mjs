@@ -12,6 +12,7 @@ const coreStub = "data:text/javascript," + encodeURIComponent(
 );
 const enterStub = "data:text/javascript," + encodeURIComponent("export const shouldSendOnEnter = () => false;");
 const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
+  .replace(/"\.\/modules\/HostCompatibility\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/HostCompatibility.js", import.meta.url).href))
   .replace(/"\.\/modules\/RecentStories\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/RecentStories.js", import.meta.url).href))
   .replace(/"\.\/modules\/MuyooMemory\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MuyooMemory.js", import.meta.url).href))
   .replace(/"\.\/modules\/MemoryEnhancementBridge\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MemoryEnhancementBridge.js", import.meta.url).href))
@@ -21,7 +22,43 @@ const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
   .replace('"../../../../script.js"', JSON.stringify(coreStub))
   .replace('"../../../RossAscends-mods.js"', JSON.stringify(enterStub));
 const extension = await import("data:text/javascript," + encodeURIComponent(source
-  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory };\n//# sourceURL=StoryBranchTree-index.test.js"));
+  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory, updateLayoutBounds, fitCompactText };\n//# sourceURL=StoryBranchTree-index.test.js"));
+
+test("detail bounds use measured terminal heights without iterator helpers", t => {
+  const prototype = Object.getPrototypeOf(Object.getPrototypeOf(new Map().values()));
+  const original = Object.getOwnPropertyDescriptor(prototype, "map");
+  Object.defineProperty(prototype, "map", { value: undefined, configurable: true });
+  t.after(() => { if (original) Object.defineProperty(prototype, "map", original); else delete prototype.map; });
+  const svg = { setAttribute(name, value) { this[name] = value; } };
+  const layout = { branches: [{ id: "main", depth: 0 }, { id: "child", depth: 1 }],
+    positions: new Map([["main", { x: 0, y: 0, width: 310 }], ["child", { x: 400, y: 100, width: 310 }]]),
+    hubPositions: new Map([["fork", { x: 117, y: 400, width: 76 }]]),
+    endPositions: new Map(), endHeights: new Map([["main", 170], ["child", 210]]), manualEnds: new Map(),
+    groups: [{ id: "fork", parentBranchId: "main", children: [{ id: "child" }] }], cardHeight: 320, hubHeight: 88, canvasWidth: 800,
+    world: { style: {}, querySelectorAll: () => [], querySelector: () => svg } };
+  extension.updateLayoutBounds(layout);
+  assert.equal(layout.endPositions.get("child").height, 210);
+  assert.equal(layout.endPositions.get("main").height, 170);
+  for (const end of layout.endPositions.values()) assert.ok(layout.maxY >= end.y + end.height + 32);
+  assert.match(svg.innerHTML, /<path/);
+});
+
+test("compact text fits actual glyph widths and reuses measurements during drag redraws", () => {
+  let reads = 0;
+  const makeText = (textContent, measured) => ({ textContent, attributes: { "data-text-width": "80", class: "label" },
+    getAttribute(name) { return this.attributes[name]; }, setAttribute(name, value) { this.attributes[name] = value; },
+    closest: () => null, getComputedTextLength() { reads++; return measured; } });
+  const widths = new Map();
+  const long = makeText("宽字符🌸", 100), short = makeText("短", 30);
+  extension.fitCompactText({ querySelectorAll: () => [long, short] }, widths);
+  assert.equal(long.attributes.textLength, "80");
+  assert.equal(long.attributes.lengthAdjust, "spacingAndGlyphs");
+  assert.equal(short.attributes.textLength, undefined);
+  const redrawn = makeText("宽字符🌸", 100);
+  extension.fitCompactText({ querySelectorAll: () => [redrawn] }, widths);
+  assert.equal(reads, 2);
+  assert.equal(redrawn.attributes.textLength, "80");
+});
 
 function setup(t) {
   let sequence = 0;
