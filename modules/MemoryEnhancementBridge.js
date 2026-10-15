@@ -1,3 +1,5 @@
+import { memoryValuesEqual } from "./MemoryState.js?v=0.1.74";
+
 // Compatibility is deliberately limited to the inspected 2.2.19 storage contract.
 export const MEMORY_ENHANCEMENT_ID = "st-memory-enhancement-2";
 export const SCHEMA_FIELD = "story_branch_tree_memory_enhancement_schema";
@@ -6,16 +8,21 @@ const FIELDS = ["hash_sheets", "tableEditMatches", SCHEMA_FIELD];
 const SCHEMA_KEYS = ["uid", "name", "domain", "type", "enable", "required", "tochat", "triggerSend", "triggerSendDeep", "config", "template"];
 const copy = value => structuredClone(value);
 
-export function installMemoryEnhancementBridge({ api, getContext, BASE, USER, DERIVED, updateSheetsView, warn = () => {} }) {
+export function installMemoryEnhancementBridge({ api, getContext, BASE, USER, DERIVED, updateSheetsView,
+  getStorageMode = () => api.getActiveRoute()?.storageMode ?? null, warn = () => {} }) {
   if (!api?.capabilities?.replyMemory || typeof BASE?.Sheet?.prototype?.save !== "function") throw Error("记忆增强桥接接口不完整。");
   let paused = false, disposed = false;
   const frames = [];
+  const recentSchemas = new WeakMap();
+  let batchDepth = 0;
+  const pendingPieces = new Set();
   const originalSave = BASE.Sheet.prototype.save;
   const originalUserSave = USER.saveChat;
   const originalResave = BASE.reSaveAllChatSheets;
+  const originalSaveAll = BASE.saveChatSheets;
   const enabled = () => !disposed && USER.tableBaseSetting.isExtensionAble !== false;
-  const native = () => api.getActiveRoute()?.storageMode === "native";
-  const canRecord = (ctx, route) => ctx.characterId != null && ctx.groupId == null && route?.storageMode !== "single";
+  const native = () => getStorageMode() === "native";
+  const canRecord = (ctx, mode) => ctx.characterId != null && ctx.groupId == null && mode !== "single";
   const store = () => {
     const ctx = getContext();
     let value = ctx.chatMetadata[SCHEMA_STORE];
@@ -25,30 +32,60 @@ export function installMemoryEnhancementBridge({ api, getContext, BASE, USER, DE
   };
   function record(piece) {
     if (!enabled() || paused || !piece || piece.is_user || !piece.hash_sheets) return;
-    const ctx = getContext(), index = ctx.chat.indexOf(piece), route = api.getActiveRoute();
-    if (index < 0 || !canRecord(ctx, route)) return;
+    if (batchDepth) { pendingPieces.add(piece); return; }
+    const ctx = getContext(), mode = getStorageMode();
+    if (!canRecord(ctx, mode)) return;
+    const index = ctx.chat.at(-1) === piece ? ctx.chat.length - 1 : ctx.chat.indexOf(piece);
+    if (index < 0) return;
     const schemas = (ctx.chatMetadata.sheets ?? []).map(sheet => Object.fromEntries(
       SCHEMA_KEYS.filter(key => Object.hasOwn(sheet, key)).map(key => [key, sheet[key]])));
-    const catalog = store(), serialized = JSON.stringify(schemas);
-    let id = Object.keys(catalog.schemas).find(key => JSON.stringify(catalog.schemas[key]) === serialized);
+    const catalog = store();
+    // Keep only an ID per live catalog, without retaining a previously open chat.
+    // Validate contents too: in-place edits/deletion cannot reuse a stale schema.
+    let id = recentSchemas.get(catalog);
+    if (!id || !memoryValuesEqual(catalog.schemas[id], schemas)) {
+      id = Object.keys(catalog.schemas).find(key => memoryValuesEqual(catalog.schemas[key], schemas));
+    }
     if (!id) {
       id = globalThis.crypto.randomUUID();
       catalog.schemas[id] = copy(schemas);
     }
+    recentSchemas.set(catalog, id);
     piece[SCHEMA_FIELD] = id;
     api.captureReplyMemory(MEMORY_ENHANCEMENT_ID, index);
-    if (route) api.notifyMemoryChanged(MEMORY_ENHANCEMENT_ID, { from: index, to: index + 1, metadata: false });
+    if (mode === "native") api.notifyMemoryChanged(MEMORY_ENHANCEMENT_ID, { from: index, to: index + 1, metadata: false });
+  }
+  function flushRecords() {
+    const depth = batchDepth, pieces = [...pendingPieces];
+    pendingPieces.clear();
+    batchDepth = 0;
+    try { for (const piece of pieces) record(piece); }
+    finally { batchDepth = depth; }
+  }
+  function batchSave(callback) {
+    batchDepth++;
+    try { return callback(); }
+    finally { if (--batchDepth === 0) flushRecords(); }
   }
   function metadataFor(snapshot) {
     const ctx = getContext(), catalog = ctx.chatMetadata[SCHEMA_STORE];
     const schemas = catalog?.schemas?.[snapshot[SCHEMA_FIELD]];
     if (!Array.isArray(schemas)) throw Error("找不到这版回复的表结构，请检查记忆增强的历史记录。");
+    const pools = new Map((ctx.chatMetadata.sheets ?? []).map(sheet => [sheet.uid, sheet]));
     const sheets = schemas.map(schema => {
-      const pool = ctx.chatMetadata.sheets?.find(sheet => sheet.uid === schema.uid) ?? catalog.retired[schema.uid];
+      const pool = pools.get(schema.uid) ?? catalog.retired[schema.uid];
       if (!pool?.cellHistory) throw Error("找不到旧表格的单元格记录，已停止恢复。");
       const hashes = snapshot.hash_sheets?.[schema.uid] ?? [];
-      const cells = new Set(pool.cellHistory.map(cell => cell.uid));
-      if (hashes.some(row => !Array.isArray(row) || row.some(uid => !cells.has(uid)))) throw Error("旧表格的单元格记录不完整，已停止恢复。");
+      const missing = new Set();
+      for (const row of hashes) {
+        if (!Array.isArray(row)) throw Error("旧表格的单元格记录不完整，已停止恢复。");
+        for (const uid of row) missing.add(uid);
+      }
+      for (const cell of pool.cellHistory) {
+        if (!missing.size) break;
+        missing.delete(cell.uid);
+      }
+      if (missing.size) throw Error("旧表格的单元格记录不完整，已停止恢复。");
       return { ...copy(schema), hashSheet: copy(hashes), cellHistory: pool.cellHistory };
     });
     return { sheets, [SCHEMA_STORE]: catalog };
@@ -71,15 +108,19 @@ export function installMemoryEnhancementBridge({ api, getContext, BASE, USER, DE
     const frame = frames.at(-1);
     record(frame?.piece ?? USER.getChatPiece()?.piece);
     if (frame) frame.captured = true;
+    // Native bulk saves are synchronous, but their USER.saveChat starts persistence.
+    // Capture the completed table set before that write, never on a later timer.
+    flushRecords();
     return originalUserSave.apply(this, args);
   }
   function wrappedResave(sheets, ...args) {
-    if (enabled() && !paused && canRecord(getContext(), api.getActiveRoute())) {
+    if (enabled() && !paused && canRecord(getContext(), getStorageMode())) {
       const catalog = store(), keep = new Set(sheets.map(sheet => sheet.uid));
       for (const sheet of getContext().chatMetadata.sheets ?? []) if (!keep.has(sheet.uid)) catalog.retired[sheet.uid] = copy(sheet);
     }
-    return originalResave.call(this, sheets, ...args);
+    return batchSave(() => originalResave.call(this, sheets, ...args));
   }
+  function wrappedSaveAll(...args) { return batchSave(() => originalSaveAll.apply(this, args)); }
   const unregister = api.registerRouteAdapter({
     id: MEMORY_ENHANCEMENT_ID, snapshotMode: "explicit", messageFields: FIELDS, metadataFields: ["sheets", SCHEMA_STORE],
     beforeSwitch(change) {
@@ -139,16 +180,19 @@ export function installMemoryEnhancementBridge({ api, getContext, BASE, USER, DE
   BASE.Sheet.prototype.save = wrappedSave;
   USER.saveChat = wrappedUserSave;
   if (originalResave) BASE.reSaveAllChatSheets = wrappedResave;
+  if (originalSaveAll) BASE.saveChatSheets = wrappedSaveAll;
   const ctx = getContext(), event = ctx.eventTypes?.MESSAGE_SWIPED, source = ctx.eventSource;
   // Must run before the plugin reparses the body and overwrites a manually edited reply.
   if (event && source?.makeFirst) source.makeFirst(event, onSwipe);
-  else { unregister(); BASE.Sheet.prototype.save = originalSave; USER.saveChat = originalUserSave; BASE.reSaveAllChatSheets = originalResave; throw Error("酒馆不支持回复记忆恢复所需的事件顺序。"); }
+  else { unregister(); BASE.Sheet.prototype.save = originalSave; USER.saveChat = originalUserSave; BASE.reSaveAllChatSheets = originalResave; BASE.saveChatSheets = originalSaveAll; throw Error("酒馆不支持回复记忆恢复所需的事件顺序。"); }
   return () => {
     disposed = true;
+    pendingPieces.clear();
     source.removeListener(event, onSwipe);
     unregister();
     if (BASE.Sheet.prototype.save === wrappedSave) BASE.Sheet.prototype.save = originalSave;
     if (USER.saveChat === wrappedUserSave) USER.saveChat = originalUserSave;
     if (BASE.reSaveAllChatSheets === wrappedResave) BASE.reSaveAllChatSheets = originalResave;
+    if (BASE.saveChatSheets === wrappedSaveAll) BASE.saveChatSheets = originalSaveAll;
   };
 }

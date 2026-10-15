@@ -1,11 +1,12 @@
 {
   "name": "sillytavern-story-branch-tree",
-  "version": "0.1.72",
+  "version": "0.1.74",
   "private": true,
   "type": "module",
   "license": "PolyForm-Noncommercial-1.0.0",
   "scripts": {
-    "check": "node --check index.js && node --check modules/StoryTree.js && node --check modules/MemoryState.js && node --check modules/NativeStory.js && node --check modules/MemoryEnhancementBridge.js && node --check modules/LegacyNative.js && node --test tests/*.test.mjs",
-    "bench:memory": "node --expose-gc tests/StoryTree.bench.mjs"
+    "check": "node --check index.js && node --check modules/StoryTree.js && node --check modules/MemoryState.js && node --check modules/NativeStory.js && node --check modules/MemoryEnhancementBridge.js && node --check modules/LegacyNative.js && node --check modules/MuyooMemory.js && node --test tests/*.test.mjs",
+    "bench:memory": "node --expose-gc tests/StoryTree.bench.mjs",
+    "bench:adapters": "node --expose-gc tests/MemoryAdapters.bench.mjs"
   }
 }

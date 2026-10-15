@@ -12,6 +12,7 @@ const coreStub = "data:text/javascript," + encodeURIComponent(
 );
 const enterStub = "data:text/javascript," + encodeURIComponent("export const shouldSendOnEnter = () => false;");
 const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
+  .replace(/"\.\/modules\/MuyooMemory\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MuyooMemory.js", import.meta.url).href))
   .replace(/"\.\/modules\/MemoryEnhancementBridge\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MemoryEnhancementBridge.js", import.meta.url).href))
   .replace(/"\.\/modules\/NativeStory\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/NativeStory.js", import.meta.url).href))
   .replace(/"\.\/modules\/StoryTree\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/StoryTree.js", import.meta.url).href))
@@ -19,7 +20,7 @@ const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
   .replace('"../../../../script.js"', JSON.stringify(coreStub))
   .replace('"../../../RossAscends-mods.js"', JSON.stringify(enterStub));
 const extension = await import("data:text/javascript," + encodeURIComponent(source
-  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded };\n//# sourceURL=StoryBranchTree-index.test.js"));
+  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory };\n//# sourceURL=StoryBranchTree-index.test.js"));
 
 function setup(t) {
   let sequence = 0;
@@ -82,6 +83,9 @@ test("native public API exposes stable route identity without storing adapter sn
   assert.equal(api.getActiveRouteKey(), info.cacheKey);
   api.registerRouteAdapter({ id: "native-api", messageFields: ["PluginMemory"], metadataFields: ["notes"] });
   ctx.chat[0].PluginMemory = { value: 2 };
+  const savedView = extension.nativeStorage.saveView;
+  extension.nativeStorage.saveView = () => { throw Error("memory notification must not save graph layout"); };
+  t.after(() => { extension.nativeStorage.saveView = savedView; });
   api.notifyMemoryChanged("native-api");
   assert.equal(ctx.chatMetadata.story_branch_tree, undefined);
   assert.equal(ctx.chatMetadata.story_branch_tree_native.route.adapterStates, undefined);
@@ -106,6 +110,20 @@ test("ordinary chat loading synchronizes its data without requiring a mounted tr
   await extension.handleChatLoaded();
   const tree = ctx.chatMetadata.story_branch_tree;
   assert.equal(resolveStoryBranch(tree)[0].mes, "加载后的正文");
+});
+
+test("ordinary synchronization does not recapture all replies; explicit route preparation captures once", async t => {
+  setup(t);
+  const original = extension.singleMemoryCompatibility.captureReplies;
+  let captures = 0;
+  extension.singleMemoryCompatibility.captureReplies = () => { captures++; };
+  t.after(() => { extension.singleMemoryCompatibility.captureReplies = original; });
+  for (let i = 0; i < 3; i++) extension.syncLiveChat();
+  assert.equal(captures, 0);
+  await extension.ensureSingleMemory({ captureReplies: true });
+  assert.equal(captures, 1);
+  await extension.ensureSingleMemory();
+  assert.equal(captures, 1);
 });
 
 for (const [name, args] of [

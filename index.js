@@ -21,10 +21,11 @@ import {
   resolveStoryBranch,
   syncActiveStoryBranch,
   validateStoryTree as validateSingleStoryTree,
-} from "./modules/StoryTree.js?v=0.1.72";
-import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.72";
-import { installMemoryEnhancementBridge } from "./modules/MemoryEnhancementBridge.js?v=0.1.72";
-import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.72";
+} from "./modules/StoryTree.js?v=0.1.74";
+import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.74";
+import { installMemoryEnhancementBridge } from "./modules/MemoryEnhancementBridge.js?v=0.1.74";
+import { createMuyooMemoryCompatibility, muyooSheetsAtMessages } from "./modules/MuyooMemory.js?v=0.1.74";
+import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.74";
 import { isGenerating, sendTextareaMessage, swipeState, updateSwipeCounter } from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
 
@@ -68,6 +69,9 @@ let originalListOnce = false;
 let nativePrepared = [];
 let nativeChangeOwner = null;
 let extensionEnabled = true;
+const singleMemoryCompatibility = createMuyooMemoryCompatibility({ getContext: context, getApi: () => publicApi,
+  getPlugin: () => storyMode(context()) === "single" && !context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")
+    ? globalThis.stMemoryEnhancement : null });
 const nativeStorage = new NativeStoryStorage(context, {
   fork: async (index, options) => (await import("../../../bookmarks.js")).createBranch(index, options),
   selectSwipe: async (message, index) => (await import("../../../../script.js")).syncSwipeToMes?.(null, index, message) ?? false,
@@ -83,7 +87,17 @@ function context() {
 
 async function connectMemoryEnhancement() {
   const api = publicApi, marker = globalThis.stMemoryEnhancement;
-  if (!api || !extensionEnabled || !marker || memoryEnhancementDispose || memoryEnhancementAttempt === api) return;
+  if (!api || !extensionEnabled) return;
+  if (storyMode(context()) === "single") {
+    memoryEnhancementDispose?.();
+    memoryEnhancementDispose = null;
+    memoryEnhancementAttempt = null;
+    await singleMemoryCompatibility.ensure();
+    return;
+  }
+  // The two modes own the same table fields; release the single-chat owner first.
+  await singleMemoryCompatibility.ensure();
+  if (!marker || memoryEnhancementDispose || memoryEnhancementAttempt === api) return;
   if (context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")) return;
   memoryEnhancementAttempt = api;
   if (marker.VERSION !== "2.2.19") {
@@ -95,13 +109,19 @@ async function connectMemoryEnhancement() {
     const manager = await import(root + "core/manager.js");
     const plugin = await import(root + "index.js");
     if (publicApi !== api || !extensionEnabled) return;
-    memoryEnhancementDispose = installMemoryEnhancementBridge({ api, getContext: context,
+    memoryEnhancementDispose = installMemoryEnhancementBridge({ api, getContext: context, getStorageMode: () => storyMode(context()),
       ...manager, updateSheetsView: plugin.updateSheetsView, warn: message => toast("warning", message) });
   } catch (error) { console.error("[StoryBranchTree] Memory enhancement bridge failed", error); toast("warning", "记忆增强桥接未能启用，请检查插件安装位置和版本。"); }
 }
 
 function isSoloChat(ctx = context()) {
   return Boolean(ctx && ctx.characterId !== undefined && ctx.characterId !== null && (ctx.groupId === undefined || ctx.groupId === null));
+}
+
+async function ensureSingleMemory({ captureReplies = false } = {}) {
+  await connectMemoryEnhancement();
+  await singleMemoryCompatibility.ensure({ forBranch: true });
+  if (captureReplies) singleMemoryCompatibility.captureReplies();
 }
 
 function toast(level, message) {
@@ -349,7 +369,7 @@ function notifyMemoryChanged(adapterId, options = {}) {
     if (task.token === options.task) task.advanceRevision();
     else task.cancel();
   }
-  storeGraph(ctx, tree);
+  if (tree.storageMode !== "native") storeGraph(ctx, tree);
 }
 
 function installPublicApi() {
@@ -463,6 +483,7 @@ function initializeRegisteredAdapterStates(tree, entries = routeAdapters.values(
 }
 
 function removePublicApi() {
+  singleMemoryCompatibility.clear();
   memoryEnhancementDispose?.();
   memoryEnhancementDispose = null;
   memoryEnhancementAttempt = null;
@@ -1369,6 +1390,7 @@ async function chooseStoryMode(mode) {
   const current = context();
   if (current.chat !== owner.chat || current.chatId !== owner.chatId || current.characterId !== owner.characterId) throw Error("聊天已改变，旧故事模式已保存，请重新打开当前故事。");
   pendingModeAction = null;
+  await connectMemoryEnhancement();
   document.querySelector('#story-branch-tree [data-role="mode-picker"]').hidden = true;
   refreshUi();
   request?.action?.();
@@ -1935,6 +1957,7 @@ function syncLiveChat({ allowInitialize = false } = {}) {
 }
 
 async function replaceActiveProjection(ctx, tree) {
+  await ensureSingleMemory();
   invalidateMemoryTasks();
   state.routeSwitching = true;
   let change;
@@ -2039,6 +2062,8 @@ async function projectRoute(ctx, tree) {
     for (const [id, saved] of inactiveMetadata) {
       captureStoryBranchAdapterMetadata(previousMetadata, "previous", ctx.chatMetadata, id, saved.metadataFields);
       // Saved state still follows the route when its owning extension is disabled.
+      if (id === "muyoo-memory-v1" && branchChange?.fork) captureStoryBranchAdapterMetadata(tree, tree.activeBranchId,
+        { sheets: muyooSheetsAtMessages(saved.metadata.sheets ?? [], messages) }, id, ["sheets"]);
     }
     await ctx.clearChat();
     assertChat();
@@ -2113,6 +2138,7 @@ async function switchHistoricalReply(messageIndex, direction) {
   if (!isSoloChat(ctx)) throw new Error("只支持单人角色聊天。");
   state.busy = true;
   try {
+    await ensureSingleMemory({ captureReplies: true });
     let tree = syncLiveChat({ allowInitialize: true });
     const reply = historicalReplySource(tree, messageIndex);
     if (!reply || !Array.isArray(reply.source.swipes) || reply.source.swipes.length < 2) {
@@ -2157,6 +2183,7 @@ async function switchHistoricalReply(messageIndex, direction) {
       ? `已切到第 ${messageIndex + 1} 楼回复 ${nextIndex + 1}；继续发送前会确认创建分支。`
       : `已恢复第 ${messageIndex + 1} 楼回复 ${nextIndex + 1} 的剧情路线。`);
   } finally {
+    singleMemoryCompatibility.releaseIfUnused();
     state.busy = false;
     refreshUi();
   }
@@ -2170,6 +2197,7 @@ async function forkFromMessage(messageIndex) {
   if (!Number.isInteger(messageIndex) || !ctx.chat[messageIndex]) throw new Error("分支消息不存在。");
   state.busy = true;
   try {
+    await ensureSingleMemory({ captureReplies: true });
     const synced = syncLiveChat({ allowInitialize: true });
     const current = context();
     const message = current.chat[messageIndex];
@@ -2179,6 +2207,7 @@ async function forkFromMessage(messageIndex) {
     await replaceActiveProjection(current, next);
     toast("success", `已从第 ${messageIndex + 1} 条消息创建“${title}”。`);
   } finally {
+    singleMemoryCompatibility.releaseIfUnused();
     state.busy = false;
     refreshUi();
   }
@@ -2191,6 +2220,7 @@ async function forkFromSwipe(messageIndex, swipeIndex) {
   if (!isSoloChat(ctx) || !ctx.chat[messageIndex] || !ctx.chat[messageIndex - 1]) throw new Error("重说回复或分叉楼层不存在。");
   state.busy = true;
   try {
+    await ensureSingleMemory({ captureReplies: true });
     const synced = syncLiveChat({ allowInitialize: true });
     const current = context();
     const id = getStoryMessageId(current.chat[messageIndex]);
@@ -2198,6 +2228,7 @@ async function forkFromSwipe(messageIndex, swipeIndex) {
     await replaceActiveProjection(current, next);
     toast("success", `已将消息 #${messageIndex} 的回复 ${swipeIndex + 1} 建为新分支。`);
   } finally {
+    singleMemoryCompatibility.releaseIfUnused();
     state.busy = false;
     refreshUi();
   }
@@ -2208,6 +2239,7 @@ async function activateBranch(branchId) {
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再切换剧情路线。");
   state.busy = true;
   try {
+    await ensureSingleMemory({ captureReplies: true });
     const ctx = context();
     if (!isSoloChat(ctx)) throw new Error("只支持单人角色聊天。");
     let tree = syncLiveChat();
@@ -2218,6 +2250,7 @@ async function activateBranch(branchId) {
     const title = getStoryBranchRows(tree).find((branch) => branch.id === branchId)?.title ?? tree.branches[branchId].title;
     toast("success", `已切换到“${title}”。`);
   } finally {
+    singleMemoryCompatibility.releaseIfUnused();
     state.busy = false;
     refreshUi();
   }
@@ -2501,7 +2534,9 @@ function installEvents(ctx) {
   const eventSource = ctx.eventSource;
   const types = ctx.eventTypes ?? ctx.event_types ?? {};
   if (!eventSource) return;
-  bindEvent(eventSource, types.APP_READY, connectMemoryEnhancement);
+  bindEvent(eventSource, types.APP_READY, async () => {
+    try { await connectMemoryEnhancement(); } catch (error) { toast("warning", error.message); }
+  });
   for (const key of ["MESSAGE_SENT", "MESSAGE_RECEIVED", "MESSAGE_SWIPED", "MESSAGE_EDITED", "MESSAGE_UPDATED", "MESSAGE_SWIPE_DELETED"]) {
     bindEvent(eventSource, types[key], (...args) => {
       if (["MESSAGE_SWIPED", "MESSAGE_EDITED", "MESSAGE_SWIPE_DELETED"].includes(key)) invalidateMemoryTasks();

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { installMemoryEnhancementBridge, MEMORY_ENHANCEMENT_ID, SCHEMA_FIELD, SCHEMA_STORE } from "../modules/MemoryEnhancementBridge.js";
 import { captureReplyMemory, readReplyMemory, restoreReplyMemory } from "../modules/StoryTree.js";
 
-function setup(t) {
+function setup(t, { onPersist = () => {} } = {}) {
   const ctx = { characterId: 0, groupId: null, chat: [{ mes: "A" }], chatMetadata: { sheets: [] },
     eventTypes: { MESSAGE_SWIPED: "swipe" }, updateChatMetadata(patch) { Object.assign(this.chatMetadata, patch); } };
   const handlers = new Map();
@@ -16,11 +16,12 @@ function setup(t) {
     getReplyMemory(id, index) { return readReplyMemory(ctx.chat[index], adapter.messageFields); },
     restoreReplyMemory(id, index) { return restoreReplyMemory(ctx.chat[index], adapter.messageFields); }, notifyMemoryChanged() {},
   };
-  const USER = { getChatPiece: () => ({ piece: ctx.chat.at(-1) }), tableBaseSetting: {}, saveChat() { saves++; } };
+  const USER = { getChatPiece: () => ({ piece: ctx.chat.at(-1) }), tableBaseSetting: {}, saveChat() { onPersist(ctx, adapter); saves++; } };
   class Sheet {
     save(piece = USER.getChatPiece().piece, manual = false) {
-      ctx.chatMetadata.sheets = [structuredClone(this.data)];
-      piece.hash_sheets = { [this.data.uid]: structuredClone(this.data.hashSheet) };
+      ctx.chatMetadata.sheets = [...ctx.chatMetadata.sheets.filter(sheet => sheet.uid !== this.data.uid), structuredClone(this.data)];
+      piece.hash_sheets ??= {};
+      piece.hash_sheets[this.data.uid] = structuredClone(this.data.hashSheet);
       if (!manual) USER.saveChat();
       return this;
     }
@@ -28,7 +29,7 @@ function setup(t) {
   const BASE = { Sheet, reSaveAllChatSheets(sheets) { ctx.chatMetadata.sheets = []; sheets.forEach(sheet => sheet.save(undefined, true)); USER.saveChat(); } }, DERIVED = { any: { chatSheetMap: {} } }, warnings = [];
   const original = Sheet.prototype.save;
   const dispose = installMemoryEnhancementBridge({ api, getContext: () => ctx, BASE, USER, DERIVED,
-    updateSheetsView: async () => { refreshes++; }, warn: message => warnings.push(message) });
+    getStorageMode: () => route.storageMode, updateSheetsView: async () => { refreshes++; }, warn: message => warnings.push(message) });
   t.after(dispose);
   const sheet = new Sheet();
   sheet.data = { uid: "s", name: "物品", type: "free", enable: true,
@@ -122,4 +123,60 @@ test("single mode and groups do not acquire bridge records or retired cell pools
     assert.equal(f.ctx.chatMetadata[SCHEMA_STORE], undefined);
     assert.equal(f.ctx.chat[0][SCHEMA_FIELD], undefined);
   }
+});
+
+test("recent schema reuse validates in-place edits, deleted entries and replacement catalogs", t => {
+  const f = setup(t);
+  f.sheet.save(undefined, true);
+  const firstId = f.ctx.chat[0][SCHEMA_FIELD];
+  f.ctx.chatMetadata[SCHEMA_STORE].schemas[firstId][0].name = "changed outside bridge";
+  f.sheet.save(undefined, true);
+  assert.notEqual(f.ctx.chat[0][SCHEMA_FIELD], firstId);
+  const secondId = f.ctx.chat[0][SCHEMA_FIELD];
+  delete f.ctx.chatMetadata[SCHEMA_STORE].schemas[secondId];
+  f.sheet.save(undefined, true);
+  assert.notEqual(f.ctx.chat[0][SCHEMA_FIELD], secondId);
+  f.ctx.chatMetadata[SCHEMA_STORE] = { version: 1, schemas: {}, retired: {} };
+  f.sheet.save(undefined, true);
+  assert.equal(Object.keys(f.ctx.chatMetadata[SCHEMA_STORE].schemas).length, 1);
+  assert.equal(f.ctx.chatMetadata[SCHEMA_STORE].schemas[f.ctx.chat[0][SCHEMA_FIELD]][0].name, "物品");
+});
+
+test("mode checks during commits do not request the full route message ID list", t => {
+  const f = setup(t);
+  f.api.getActiveRoute = () => { throw Error("full route query"); };
+  f.sheet.save();
+  assert.ok(f.ctx.chat[0][SCHEMA_FIELD]);
+  assert.equal(f.counts().saves, 1);
+});
+
+test("bulk saves capture once before persistence and release the batch after errors", t => {
+  const f = setup(t, { onPersist(ctx, adapter) {
+    assert.deepEqual(readReplyMemory(ctx.chat[0], adapter.messageFields).hash_sheets, ctx.chat[0].hash_sheets);
+  } });
+  let captured = 0, persisted = 0;
+  const capture = f.api.captureReplyMemory;
+  f.api.captureReplyMemory = (...args) => { captured++; return capture(...args); };
+  const other = new f.BASE.Sheet(); other.data = { ...structuredClone(f.sheet.data), uid: "other" };
+  // Use the real bulk-call ordering and verify the snapshot at the write boundary.
+  f.BASE.reSaveAllChatSheets([f.sheet, other]);
+  assert.equal(captured, 1);
+  assert.equal(f.ctx.chat[0][SCHEMA_FIELD], Object.keys(f.ctx.chatMetadata[SCHEMA_STORE].schemas)[0]);
+  assert.deepEqual(Object.keys(readReplyMemory(f.ctx.chat[0], f.adapter().messageFields).hash_sheets), ["s", "other"]);
+  persisted = f.counts().saves;
+  const throwing = { save() { throw Error("bulk-error"); } };
+  assert.throws(() => f.BASE.reSaveAllChatSheets([f.sheet, throwing]), /bulk-error/);
+  assert.equal(f.counts().saves, persisted);
+  const afterError = captured;
+  f.sheet.save();
+  assert.equal(captured, afterError + 1);
+});
+
+test("native restoration still rejects missing cells after optimizing history validation", t => {
+  const f = setup(t);
+  f.sheet.save(undefined, true);
+  const piece = structuredClone(f.ctx.chat[0]);
+  f.ctx.chatMetadata.sheets[0].cellHistory.pop();
+  assert.throws(() => f.adapter().onFork({ storageMode: "native", getMessages: () => [piece],
+    getReplyMemory: () => readReplyMemory(piece, f.adapter().messageFields) }), /不完整/);
 });

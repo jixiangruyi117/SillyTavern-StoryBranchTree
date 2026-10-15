@@ -1,4 +1,4 @@
-import { captureMemoryState, restoreMemoryState } from "./MemoryState.js?v=0.1.72";
+import { captureMemoryState, restoreMemoryState } from "./MemoryState.js?v=0.1.74";
 
 export const TREE_METADATA_KEY = "story_branch_tree";
 export const SWIPE_MESSAGE_FIELDS_KEY = "story_branch_tree_swipe_message_fields";

@@ -1,5 +1,5 @@
-import { getStoryMessageId, setStoryMessageId, copyStoryMessageIdentity } from "./StoryTree.js?v=0.1.72";
-import { legacyComponent, legacyDigest, summarizeLegacy } from "./LegacyNative.js?v=0.1.72";
+import { getStoryMessageId, setStoryMessageId, copyStoryMessageIdentity } from "./StoryTree.js?v=0.1.74";
+import { legacyComponent, legacyDigest, summarizeLegacy } from "./LegacyNative.js?v=0.1.74";
 
 export const NATIVE_KEY = "story_branch_tree_native";
 export const MODE_KEY = "story_branch_tree_mode";
