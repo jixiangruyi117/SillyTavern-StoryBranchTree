@@ -184,11 +184,13 @@ body.story-branch-tree-confirm-open {
   stroke-linejoin: round;
 }
 
-.story-branch-tree__toolbar .story-branch-tree__appearance-icon text {
-  fill: currentColor;
-  stroke: none;
-  font-size: 16px;
-  font-weight: 700;
+.story-branch-tree__toolbar [data-action="toggle-appearance"] {
+  display: grid;
+  place-items: center;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  padding: 0;
 }
 
 .story-branch-tree__toolbar .story-branch-tree__view-icon--detail,
@@ -200,9 +202,22 @@ body.story-branch-tree-confirm-open {
   display: block;
 }
 
-.story-branch-tree__toolbar :is([data-action="toggle-view"], [data-action="toggle-appearance"])[aria-pressed="true"] {
+.story-branch-tree__toolbar [data-action="toggle-view"][aria-pressed="true"] {
   border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #b9915a) 65%, transparent);
   background: color-mix(in srgb, var(--SmartThemeQuoteColor, #b9915a) 17%, transparent);
+}
+
+/* State colors also apply while hovered/focused; hover must not mimic "on". */
+.story-branch-tree__toolbar [data-action="toggle-appearance"][aria-pressed="false"] {
+  color: #c6cad1;
+  border-color: #6b717b;
+  background: #34383f;
+}
+
+.story-branch-tree__toolbar [data-action="toggle-appearance"][aria-pressed="true"] {
+  color: #ffdfa3;
+  border-color: #dfb777;
+  background: #5a4b31;
 }
 
 .story-branch-tree__close {
