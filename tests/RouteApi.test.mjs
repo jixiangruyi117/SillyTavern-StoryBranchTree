@@ -12,12 +12,14 @@ const coreStub = "data:text/javascript," + encodeURIComponent(
 );
 const enterStub = "data:text/javascript," + encodeURIComponent("export const shouldSendOnEnter = () => false;");
 const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
+  .replace(/"\.\/modules\/MemoryEnhancementBridge\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MemoryEnhancementBridge.js", import.meta.url).href))
+  .replace(/"\.\/modules\/NativeStory\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/NativeStory.js", import.meta.url).href))
   .replace(/"\.\/modules\/StoryTree\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/StoryTree.js", import.meta.url).href))
   .replace(/"\.\/modules\/MemoryState\.js(?:\?[^\"]*)?"/, JSON.stringify(new URL("../modules/MemoryState.js", import.meta.url).href))
   .replace('"../../../../script.js"', JSON.stringify(coreStub))
   .replace('"../../../RossAscends-mods.js"', JSON.stringify(enterStub));
 const extension = await import("data:text/javascript," + encodeURIComponent(source
-  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply };\n//# sourceURL=StoryBranchTree-index.test.js"));
+  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded };\n//# sourceURL=StoryBranchTree-index.test.js"));
 
 function setup(t) {
   let sequence = 0;
@@ -47,6 +49,64 @@ function setup(t) {
   });
   return { ctx, tree, target, api: globalThis.SillyTavernStoryBranchTree, makeId: () => `id-${++sequence}` };
 }
+
+test("reply API respects ownership, ordinary chats, target hooks and expired API references", async t => {
+  const { ctx, api, makeId } = setup(t);
+  const fields = ["PluginMemory"];
+  api.registerRouteAdapter({ id: "reply-owner", messageFields: fields,
+    beforeSwitch() { api.captureReplyMemory("reply-owner", 0); },
+    onFork(change) { assert.equal(change.getReplyMemory(0).PluginMemory, 12); },
+  });
+  ctx.chat[0].PluginMemory = 12;
+  api.captureReplyMemory("reply-owner", 0);
+  const value = api.getReplyMemory("reply-owner", 0);
+  value.PluginMemory = 50;
+  assert.equal(api.getReplyMemory("reply-owner", 0).PluginMemory, 12);
+  assert.throws(() => api.captureReplyMemory("unknown", 0), /未注册/);
+  const initial = extension.syncLiveChat();
+  await extension.replaceActiveProjection(ctx, createStoryBranch(initial, getStoryMessageId(ctx.chat[0]), undefined, makeId));
+  extension.removePublicApi();
+  assert.equal(api.getReplyMemory("reply-owner", 0), null);
+  assert.throws(() => api.captureReplyMemory("reply-owner", 0), /停用/);
+});
+
+test("native public API exposes stable route identity without storing adapter snapshots", async t => {
+  const { ctx, api } = setup(t);
+  ctx.chatMetadata = { notes: { value: 1 } };
+  ctx.characters = [{ avatar: "native-api.png", name: "Native" }];
+  ctx.extensionSettings = {};
+  await extension.nativeStorage.initialize();
+  const info = api.getActiveRoute();
+  assert.equal(info.storageMode, "native");
+  assert.equal(info.cacheKey, JSON.stringify([info.storyId, info.branchId]));
+  assert.equal(api.getActiveRouteKey(), info.cacheKey);
+  api.registerRouteAdapter({ id: "native-api", messageFields: ["PluginMemory"], metadataFields: ["notes"] });
+  ctx.chat[0].PluginMemory = { value: 2 };
+  api.notifyMemoryChanged("native-api");
+  assert.equal(ctx.chatMetadata.story_branch_tree, undefined);
+  assert.equal(ctx.chatMetadata.story_branch_tree_native.route.adapterStates, undefined);
+  assert.deepEqual(api.getRouteMetadata("native-api"), { notes: { value: 1 } });
+  assert.equal(api.getRouteMessages("not-loaded"), null);
+  const copy = api.getRouteMessages();
+  copy[0].PluginMemory.value = 9;
+  assert.equal(ctx.chat[0].PluginMemory.value, 2);
+  const task = api.beginMemoryTask("native-api");
+  ctx.groupId = "group";
+  assert.equal(api.getActiveRoute(), null);
+  assert.equal(api.getActiveRouteKey(), null);
+  assert.equal(task.isCurrent(), false);
+});
+
+test("ordinary chat loading synchronizes its data without requiring a mounted tree panel", async t => {
+  const { ctx } = setup(t);
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "document");
+  globalThis.document = { getElementById: () => null };
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "document", previous); else delete globalThis.document; });
+  ctx.chat[0].mes = "加载后的正文";
+  await extension.handleChatLoaded();
+  const tree = ctx.chatMetadata.story_branch_tree;
+  assert.equal(resolveStoryBranch(tree)[0].mes, "加载后的正文");
+});
 
 for (const [name, args] of [
   ["saveCardPosition", id => [id, { x: -40, y: 60 }]],
@@ -471,6 +531,26 @@ test("render failure restores the previous projection and its adapter before rep
   assert.deepEqual(ctx.chat, initial);
   assert.equal(api.getActiveRoute().branchId, tree.rootBranchId);
   assert.deepEqual(order, ["prepare", "restore-old-memory", "render-old-chat"]);
+});
+
+test("fork projection rollback does not change shared saved messages or the source route snapshots", async t => {
+  const { ctx, api, makeId } = setup(t);
+  ctx.chat[0].PluginMemory = { value: "saved" };
+  api.registerRouteAdapter({ id: "fork-rollback", messageFields: ["PluginMemory"], metadataFields: ["notes"] });
+  const source = extension.syncLiveChat();
+  const saved = JSON.stringify(source);
+  const child = createStoryBranch(source, getStoryMessageId(ctx.chat[0]), undefined, makeId);
+  ctx.chat[0].PluginMemory.value = "prepared";
+  ctx.chat[0].is_hidden = true;
+  ctx.chatMetadata.notes = { value: "prepared metadata" };
+  let renders = 0;
+  ctx.printMessages = async () => { if (!renders++) throw Error("fork-render-failure"); };
+  await assert.rejects(extension.replaceActiveProjection(ctx, child), /fork-render-failure/);
+  assert.equal(ctx.chatMetadata.story_branch_tree, source);
+  assert.equal(JSON.stringify(source), saved);
+  assert.equal(ctx.chat[0].PluginMemory.value, "prepared");
+  assert.equal(ctx.chat[0].is_hidden, true);
+  assert.equal(ctx.chatMetadata.notes.value, "prepared metadata");
 });
 
 test("chat changes during adapter preparation cannot overwrite the newly opened chat", async t => {

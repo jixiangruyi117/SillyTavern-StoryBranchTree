@@ -29,6 +29,49 @@ body.story-branch-tree-confirm-open {
   display: none !important;
 }
 
+#story-branch-tree [hidden] { display: none !important; }
+#story-branch-tree:not(.is-library) [data-action="back-to-tree"],
+#story-branch-tree.is-library .story-branch-tree__toolbar button:not([data-action="back-to-tree"]),
+#story-branch-tree.is-library .story-branch-tree__zoom { display: none; }
+.story-branch-tree__mode-picker,
+.story-branch-tree__library { overflow: auto; padding: 1em; }
+.story-branch-tree__mode-picker button {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.5em;
+  width: min(100%, 24em);
+  margin: 0.4em;
+  padding: 1em;
+  text-align: left;
+}
+.story-branch-tree__library-entry {
+  margin-block: 0.75em;
+  padding: 1em;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-radius: 0.6em;
+  overflow-wrap: anywhere;
+}
+.story-branch-tree__library button,
+.story-branch-tree__mode-picker button,
+.story-branch-tree__reply-actions button {
+  min-height: 44px;
+  padding: 0.45em 0.75em;
+  color: inherit;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-radius: 0.4em;
+  cursor: pointer;
+}
+.story-branch-tree__library-tools,
+.story-branch-tree__library-entry > div,
+.story-branch-tree__reply-actions { display: flex; flex-wrap: wrap; gap: 0.5em; margin-block: 0.5em; }
+.story-branch-tree__reply-actions { padding: 0.75em; }
+.story-branch-tree__legacy-row { display: flex; align-items: flex-start; gap: 0.75em; padding: 0.85em; border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent); overflow-wrap: anywhere; cursor: pointer; }
+.story-branch-tree__legacy-row input { flex: 0 0 auto; margin-block-start: 0.3em; }
+.story-branch-tree__legacy-row span { min-width: 0; }
+.story-branch-tree__legacy-row small { display: block; margin-block-start: 0.35em; opacity: 0.8; }
+.story-branch-tree__legacy-row:has(input:disabled) { cursor: default; }
+
 .story-branch-tree__header {
   z-index: 2;
   display: grid;
@@ -65,6 +108,7 @@ body.story-branch-tree-confirm-open {
 
 .story-branch-tree__toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.3em;
   flex: 0 0 auto;

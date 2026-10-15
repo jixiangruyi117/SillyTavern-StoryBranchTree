@@ -2,10 +2,10 @@
 
 本文面向记忆总结、表格、隐藏楼层及提示词注入插件的作者。**先选择接入范围，再阅读对应示例。**
 
-- 文档核对基线：剧情分支树 **0.1.68**，API **version: 1**。
+- 文档核对基线：剧情分支树 **0.1.72**，API **version: 1**。
 - 插件版本与 API 版本不是同一个概念；当前 API 没有 `pluginVersion` 属性。新增能力检查 `capabilities`，不能只检查 `version === 1`。
 - 查询不会创建剧情树、生成摘要或请求模型。没有剧情树时，记忆插件继续自己的普通聊天流程。
-- 本文代码自行编写；字段名和适配器 ID 都是示例，不对应任何具体第三方记忆插件。
+- 本文示例中的字段名和适配器 ID 为示意；内置记忆增强桥接使用 `st-memory-enhancement-2`，不要重复注册它拥有的字段。
 - 各代码块是独立示例，不要合并后顺序执行。完整框架中的插件服务需由接入者实现；第二节的小示例可单独运行。
 
 ## 目录
@@ -23,6 +23,22 @@
 <a id="quick-start"></a>
 
 ## 1. 快速开始与接入范围
+
+### 先区分故事存储模式
+
+0.1.70 增加 `capabilities.nativeStorage`。当前路线的 `storageMode === "native"` 表示酒馆原生分支；未设置此属性的现有路线继续使用单聊天模式。模式按故事固定，不自动转换旧存档。
+
+- **单聊天模式**：下文的共享前文、路线字段/元数据快照及后台读取已归档路线机制保持不变。
+- **原生模式**：每条路线是独立聊天文件，正常持久化保存该聊天自己的消息和元数据。不会再创建一份 `adapterStates` 镜像；`notifyMemoryChanged` 更新任务版本和轻量路线描述，消息/元数据仍由插件沿用酒馆保存。
+- 原生模式的 `getRouteMessages()` 同步读取当前路线；非当前路线返回 `null`，不会偷偷下载文件。需要目标路线数据的准备钩子使用 `change.getMessages()`。`getRouteMetadata()` 对当前路线复制插件声明的当前元数据字段；非当前路线返回 `null`，不是已归档容器快照。
+- `cacheKey` 应视为不透明字符串。单聊天模式仍为 `[chatId, branchId]`；原生模式为 `[storyId, branchId]` 的 JSON 字符串，以便新文件名尚未分配时，准备钩子和完成事件仍使用同一个键。原生 RouteInfo/RouteChange 额外提供 `storyId`；新原生分支准备时 `chatId` 为 `null`，打开文件后的完成事件填入实际聊天名。
+- 原生切换仍执行已注册适配器的准备/历史分叉/完成钩子，走酒馆正常聊天加载事件，不额外投影所有路线或伪造带 `detail.storyBranchTree` 的加载事件。接入者须在准备期间暂停普通加载回调，避免恢复及自动总结重复执行。`onFork` 返回的已声明元数据只写入新文件；切换已有路线时，准备返回的已声明元数据在目标打开后应用。
+- 原生分叉继承源聊天的当前元数据，不会自动撤销包含分叉点之后剧情的摘要。历史回溯由插件依据其逐楼/逐回复数据和 `onFork` 完成；没有历史依据时不得宣称记忆完整或直接把新路线视为空记忆。
+- 0.1.70 指定历史重说创建新原生文件时，在目标聊天打开并核对身份后、`afterSwitch` 前补发一次原生 `MESSAGE_SWIPED`，参数为目标消息的零基索引。普通分叉与重新打开已有路线不补发。监听器应返回真实恢复 Promise；插件自行启动的防抖任务仍由插件负责，事件派发完成不代表这些任务已结束。此事件让插件重新处理回复，不会自动为没有历史快照的数据建立历史版本。
+
+其余字段所有权、任务凭证、注销与恢复失败边界继续适用。真实第三方插件兼容性仍需接入者单独验证。
+
+0.1.71 增加 `capabilities.replyMemory`：适配器可显式保存、读取和恢复自己声明的逐回复字段，供手动修改后的回复版本及历史分叉使用。普通单人聊天也可提前记录；这些方法不会自行建树或保存聊天。`beforeSwitch` / `onFork` 中的 `change.getReplyMemory(index)` 读取目标前文中该消息已选回复的记录，只返回当前适配器的字段副本。先检查记录是否存在，再构造历史容器；不要把当前容器冒充旧版本。
 
 ### 只识别路线
 
@@ -202,7 +218,7 @@ api.registerRouteAdapter({
 
 ### 身份、索引与数据完整性
 
-`cacheKey` 是 `JSON.stringify([chatId, branchId])`。它用于路线分区；显示名称、路线编号和楼层号会改变或重复，不能作为主键。外部数据库跨角色、账号或宿主共享时，再加原有命名空间。
+`cacheKey` 用于路线分区，应作为不透明字符串使用；两种模式的组成见第一节。显示名称、路线编号和楼层号会改变或重复，不能作为主键。外部数据库跨角色、账号或宿主共享时，再加原有命名空间。
 
 - 消息索引和 `sourceSwipeIndex` 为零基。
 - `forkFloor`、`replyFloor` 以及树图显示的楼层为一基。
@@ -210,7 +226,7 @@ api.registerRouteAdapter({
 - 稳定消息 ID 和回复版本 ID 用于确认“是哪条消息、哪个回复”；新消息尚未同步时 `messageIds` 中可以出现 `null`。
 - **快照存在不等于历史完整**。分支树不判断摘要是否覆盖所有剧情，不提供 `coverage.complete` 或缺失楼层列表。接入者自行记录覆盖范围和可恢复程度。
 - 外部数据库、向量索引或私有缓存不会自动进入聊天导出文件；这些数据的分区、导出和恢复由对应插件负责。
-- 分支树不扫描、识别或调用特定记忆插件。只有插件主动注册适配器并声明自己负责的字段后，这些字段才会随路线快照与恢复；未接入的插件仍按原本的聊天级逻辑运行。
+- 通用接口不推断第三方插件的字段或恢复算法。0.1.71 内置记忆增强 2.2.19 专用桥接，通过同一接口声明 `hash_sheets`、`tableEditMatches` 和表结构版本；其余插件没有新增专用适配。记忆增强需保持标准目录 `st-memory-enhancement`，其他版本不会启用该桥接。旧版未记录的数据仍有历史回溯限制，详见 README。
 
 <a id="lifecycle"></a>
 
@@ -443,6 +459,8 @@ function recordSelectedReply(message, fields) {
     explicitSnapshots: true, // explicit 快照模式
     metadataSnapshots: true, // 聊天级容器快照
     routeList: true,          // 轻量路线列表
+    nativeStorage: true,      // 支持原生故事；按 RouteInfo.storageMode 判断当前模式
+    replyMemory: true,        // 声明字段的逐回复记录、查询和恢复
   },
 })
 ```
@@ -455,6 +473,8 @@ function recordSelectedReply(message, fields) {
 
 ```ts
 interface RouteInfo {
+  storageMode?: "native";
+  storyId?: string;
   version: 1;
   chatId: string | null;
   characterId: number | string | null;
@@ -506,7 +526,7 @@ interface MemoryTask {
 }
 ```
 
-RouteInfo 是查询时的副本；修改其名称或 ID 不修改剧情树。图中编号不是这些接口的存储 ID。准备钩子的 change 在 RouteChange 上额外提供 `getMessages(options?)`；方法不进入 DOM 完成事件。
+RouteInfo 是查询时的副本；修改其名称或 ID 不修改剧情树。图中编号不是这些接口的存储 ID。准备钩子的 change 在 RouteChange 上额外提供 `getMessages(options?)` 和 `getReplyMemory(index)`；方法不进入 DOM 完成事件。
 
 ### getActiveRoute()
 
@@ -567,6 +587,33 @@ const rows = api.getRouteMessages(undefined, {
 ```js
 const saved = api.getRouteMetadata("example-memory-v1", branchId);
 ```
+
+### captureReplyMemory(id, index)
+
+- 先检查 `capabilities.replyMemory`，并注册自己的 `messageFields`。在插件完成实际数据写入后，显式记录当前 AI 回复的这些字段；字段缺失也会被记录。
+- 索引为当前聊天的零基消息索引。方法保存当前所选回复，不修改正文或切换重说，不自动保存聊天；接着沿用插件原有的 `saveChat()`。
+- 普通单人聊天没有剧情树时也能记录。API 停用、未注册、非单人聊天、恢复未完成时拒绝写入。切换过程中仅允许正在执行自己 `beforeSwitch` 的适配器采集源回复。
+- 不会采集聊天元数据或完整数据库。大容器应由插件维护历史索引，并只在消息字段中记录引用；异步写回仍须使用原有任务保护。
+
+```js
+current.chat[index].ExampleMessageMemory = { note: "玩家手改后的结果" };
+api.captureReplyMemory("example-memory-v1", index);
+await current.saveChat();
+```
+
+### getReplyMemory(id, index, options?)
+
+- 返回该适配器声明字段的副本。`options: { swipeId }` 可指定同楼其他回复，省略时读取当前所选回复。
+- `null` 表示该版没有完整记录，或正文在记录后被修改；`{}` 表示已明确记录所有声明字段均缺失。两者不能混用。这个判断不代表摘要或外部数据库的完整性。
+- 正文指纹用于避免误用已改写正文的记录，不是防篡改签名。无效索引/回复、损坏记录或当前 API 上未注册 ID 会抛错；API 已停用时返回 `null`。
+- 只读当前聊天，不下载其他聊天文件。准备历史分叉时使用 `change.getReplyMemory(index)`，它读取目标消息及目标已选回复，不是源聊天当前所显示的回复。
+
+### restoreReplyMemory(id, index)
+
+- 将当前所选回复的记录恢复到该消息，只修改适配器声明的顶层字段；已记录缺失的字段会被删除。
+- 成功返回 `true`；记录未知或正文已改变返回 `false`，不会当作空记忆覆盖。拒绝未注册、停用 API 或不支持的聊天。
+- 切换中仅允许正在执行自己 `afterSwitch` 的适配器恢复目标。不会重建插件缓存、恢复元数据或自动保存；这些仍由插件自己完成。
+- 使用这些方法不等于自动兼容重说：接入者仍需在自己的写入入口采集、按原生回复切换事件的正确顺序恢复，并重新建立缓存与注入。
 
 ### registerRouteAdapter(adapter)
 

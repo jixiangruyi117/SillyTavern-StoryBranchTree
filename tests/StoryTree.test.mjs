@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   activateStoryBranch,
+  captureStoryBranchAdapterState,
+  captureStoryBranchAdapterMetadata,
   createStoryBranch,
   createStoryBranchFromSwipe,
   createStoryTree,
@@ -11,6 +13,7 @@ import {
   syncActiveStoryBranch,
   validateStoryTree,
 } from "../modules/StoryTree.js";
+import { captureMemoryState } from "../modules/MemoryState.js";
 
 function ids() {
   let next = 0;
@@ -20,6 +23,92 @@ function ids() {
 function message(mes, options = {}) {
   return { name: "Rin", is_user: false, mes, ...options };
 }
+
+test("fork preparation shares saved bodies but isolates records, inherited state and returned messages", t => {
+  const makeId = ids();
+  const chat = [message("前文", { PluginMemory: { events: ["原状态"] }, is_hidden: true }), message("后续")];
+  const root = createStoryTree(chat, makeId);
+  captureStoryBranchAdapterState(root, root.rootBranchId, chat, "memory", ["PluginMemory"]);
+  captureStoryBranchAdapterMetadata(root, root.rootBranchId, { notes: { text: "原容器" } }, "memory", ["notes"]);
+  root.layout = { [root.rootBranchId]: { x: 1, y: 2 } };
+  const saved = JSON.stringify(root);
+  const original = globalThis.structuredClone;
+  let treeCopies = 0;
+  let chatCopies = 0;
+  globalThis.structuredClone = value => {
+    if (value?.messages && value?.branches) treeCopies++;
+    if (Array.isArray(value) && value.some(item => typeof item?.mes === "string")) chatCopies++;
+    return original(value);
+  };
+  t.after(() => { globalThis.structuredClone = original; });
+  const next = createStoryBranch(root, getStoryMessageId(chat[0]), undefined, makeId);
+  assert.equal(treeCopies, 0);
+  assert.equal(chatCopies, 0);
+  assert.equal(next.messages[getStoryMessageId(chat[1])], root.messages[getStoryMessageId(chat[1])]);
+  assert.notEqual(next.branches[root.rootBranchId], root.branches[root.rootBranchId]);
+  next.layout[root.rootBranchId].x = 9;
+  const inherited = next.branches[next.activeBranchId].adapterStates.memory;
+  inherited.messages[getStoryMessageId(chat[0])].PluginMemory.events.push("新路线");
+  inherited.metadata.notes.text = "新容器";
+  const previousRoute = resolveStoryBranch(next, root.rootBranchId);
+  previousRoute[0].is_hidden = false;
+  captureMemoryState(next.branches[root.rootBranchId], previousRoute);
+  captureStoryBranchAdapterState(next, root.rootBranchId, previousRoute, "memory", ["PluginMemory"]);
+  captureStoryBranchAdapterMetadata(next, root.rootBranchId, { notes: { text: "准备中的容器" } }, "memory", ["notes"]);
+  const projected = resolveStoryBranch(next);
+  projected[0].extra.arbitrary = { value: "外部改动" };
+  assert.equal(JSON.stringify(root), saved);
+  assert.equal(resolveStoryBranch(next)[0].extra.arbitrary, undefined);
+});
+
+test("graph labels do not expand inactive parent bodies or restore their native state", () => {
+  const makeId = ids();
+  const root = createStoryTree([message("开场"), message("分叉"), message("主线结尾")], makeId);
+  let child = createStoryBranch(root, getStoryMessageId(resolveStoryBranch(root)[1]), undefined, makeId);
+  child = syncActiveStoryBranch(child, [...resolveStoryBranch(child), message("子线结尾")]).tree;
+  const childId = child.activeBranchId;
+  const suffixId = child.branches[childId].messageIds[0];
+  const nested = createStoryBranch(child, suffixId, undefined, makeId);
+  const main = activateStoryBranch(nested, root.rootBranchId);
+  const expected = getStoryBranchRows(main);
+  Object.defineProperty(main.messages[suffixId], "UnusedMemory", {
+    enumerable: true, get() { throw Error("inactive parent body was expanded"); },
+  });
+  Object.defineProperty(main.branches[childId].memoryState[suffixId].fields, "is_hidden", {
+    enumerable: true, get() { throw Error("inactive parent native state was restored"); },
+  });
+  assert.deepEqual(getStoryBranchRows(main), expected);
+});
+
+test("graph reply labels track stable variants on nested and imported legacy routes", () => {
+  const makeId = ids();
+  const chat = [message("问题", { is_user: true }), message("回复 B", {
+    swipes: ["回复 A", "回复 B"], swipe_id: 1, swipe_info: [{ extra: {} }, { extra: {} }],
+  })];
+  const root = createStoryTree(chat, makeId);
+  const child = createStoryBranchFromSwipe(root, getStoryMessageId(chat[1]), 0, undefined, makeId);
+  const childId = child.activeBranchId;
+  const continued = syncActiveStoryBranch(child, [...resolveStoryBranch(child), message("下一步 Y", {
+    swipes: ["下一步 X", "下一步 Y"], swipe_id: 1, swipe_info: [{ extra: {} }, { extra: {} }],
+  })]).tree;
+  const replyId = continued.branches[childId].messageIds.at(-1);
+  const nested = createStoryBranchFromSwipe(continued, replyId, 0, undefined, makeId);
+  const nestedId = nested.activeBranchId;
+  const originalRows = getStoryBranchRows(nested);
+  assert.equal(originalRows.find(row => row.id === childId).branchNumber, "1.R2.1");
+  assert.equal(originalRows.find(row => row.id === nestedId).branchNumber, "1.R2.1.R3.1");
+  const imported = JSON.parse(JSON.stringify(nested));
+  delete imported.branches[nestedId].sourceMessageId;
+  const source = imported.messages[replyId];
+  source.swipes.reverse();
+  source.swipe_info.reverse();
+  const rows = getStoryBranchRows(imported);
+  const row = rows.find(row => row.id === nestedId);
+  assert.equal(row.sourceMessageId, replyId);
+  assert.equal(row.replyIndex, 1);
+  assert.equal(row.sourceVariantPresent, true);
+  assert.equal(row.branchNumber, "1.R2.1.R3.1");
+});
 
 test("sync copies live messages once without cloning the read-only saved projection", t => {
   const makeId = ids();

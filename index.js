@@ -2,6 +2,9 @@ import {
   TREE_METADATA_KEY,
   activateStoryBranch,
   copyStoryMessageIdentity,
+  captureReplyMemory,
+  readReplyMemory,
+  restoreReplyMemory,
   captureStoryBranchAdapterState,
   adapterMetadataFieldNames,
   captureStoryBranchAdapterMetadata,
@@ -10,16 +13,18 @@ import {
   createStoryBranchFromSwipe,
   createStoryTree,
   deleteStoryBranch,
-  getStoryBranchRows,
+  getStoryBranchRows as getSingleStoryRows,
   getStoryMessageId,
   copyMessageRange,
   messageReadOptions,
   readStoryBranchMessages,
   resolveStoryBranch,
   syncActiveStoryBranch,
-  validateStoryTree,
-} from "./modules/StoryTree.js?v=0.1.68";
-import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.68";
+  validateStoryTree as validateSingleStoryTree,
+} from "./modules/StoryTree.js?v=0.1.72";
+import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.72";
+import { installMemoryEnhancementBridge } from "./modules/MemoryEnhancementBridge.js?v=0.1.72";
+import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.72";
 import { isGenerating, sendTextareaMessage, swipeState, updateSwipeCounter } from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
 
@@ -51,10 +56,48 @@ let publicApi = null;
 let activeProjection = null;
 let adapterRecoveryKey = null;
 let adapterRecoveryOwner = null;
+let adapterPreparingOwner = null;
+let memoryEnhancementDispose = null;
+let memoryEnhancementAttempt = null;
+let pendingModeAction = null;
+let nativePreview = null;
+let libraryEntries = [];
+let legacySearch = null;
+let legacyPlan = null;
+let originalListOnce = false;
+let nativePrepared = [];
+let nativeChangeOwner = null;
+let extensionEnabled = true;
+const nativeStorage = new NativeStoryStorage(context, {
+  fork: async (index, options) => (await import("../../../bookmarks.js")).createBranch(index, options),
+  selectSwipe: async (message, index) => (await import("../../../../script.js")).syncSwipeToMes?.(null, index, message) ?? false,
+  prepare: prepareNativeChange,
+  complete: completeNativeChange,
+  aborted: abortNativeChange,
+});
 const view = { x: 48, y: 48, scale: 1, needsFit: true, dragging: false, pointerId: null, startX: 0, startY: 0, originX: 0, originY: 0 };
 
 function context() {
   return globalThis.SillyTavern?.getContext?.();
+}
+
+async function connectMemoryEnhancement() {
+  const api = publicApi, marker = globalThis.stMemoryEnhancement;
+  if (!api || !extensionEnabled || !marker || memoryEnhancementDispose || memoryEnhancementAttempt === api) return;
+  if (context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")) return;
+  memoryEnhancementAttempt = api;
+  if (marker.VERSION !== "2.2.19") {
+    toast("warning", "记忆增强当前版本尚未验证，未启用专用桥接。原生聊天仍按原有方式运行。");
+    return;
+  }
+  try {
+    const root = "../st-memory-enhancement/";
+    const manager = await import(root + "core/manager.js");
+    const plugin = await import(root + "index.js");
+    if (publicApi !== api || !extensionEnabled) return;
+    memoryEnhancementDispose = installMemoryEnhancementBridge({ api, getContext: context,
+      ...manager, updateSheetsView: plugin.updateSheetsView, warn: message => toast("warning", message) });
+  } catch (error) { console.error("[StoryBranchTree] Memory enhancement bridge failed", error); toast("warning", "记忆增强桥接未能启用，请检查插件安装位置和版本。"); }
 }
 
 function isSoloChat(ctx = context()) {
@@ -66,7 +109,101 @@ function toast(level, message) {
 }
 
 function graphFrom(ctx) {
+  if (ctx?.chatMetadata?.[NATIVE_KEY]) {
+    if (!isSoloChat(ctx)) return null;
+    storyMode(ctx);
+    return nativeStorage.view(ctx);
+  }
   return ctx?.chatMetadata?.[TREE_METADATA_KEY] ?? null;
+}
+
+function getStoryBranchRows(tree) {
+  return tree?.storageMode === "native" ? nativeRows(tree) : getSingleStoryRows(tree);
+}
+
+function validateStoryTree(tree) {
+  return tree?.storageMode === "native" ? (nativeRows(tree), true) : validateSingleStoryTree(tree);
+}
+
+async function prepareNativeChange(change, messages, refreshTarget) {
+  state.routeSwitching = true;
+  invalidateMemoryTasks();
+  nativePrepared = [];
+  const ctx = context();
+  nativeChangeOwner = { chat: ctx.chat, chatId: ctx.chatId, characterId: ctx.characterId };
+  const assertOwner = () => { const current = context(); if (current.chat !== nativeChangeOwner.chat || current.chatId !== nativeChangeOwner.chatId || current.characterId !== nativeChangeOwner.characterId) throw Error("聊天已改变，停止旧路线的记忆准备。"); };
+  const overrides = {};
+  const accept = (adapter, result) => {
+    if (result?.metadata === undefined) return;
+    if (!result.metadata || typeof result.metadata !== "object" || Array.isArray(result.metadata)
+      || Object.keys(result.metadata).some(key => !adapter.metadataFields.includes(key))) throw Error("记忆钩子返回了未声明的聊天元数据。");
+    Object.assign(overrides, structuredClone(result.metadata));
+  };
+  for (const adapter of routeAdapters.values()) {
+    let target = messages;
+    const detail = { ...structuredClone(change), previousRoute: getActiveRouteInfo(),
+      getMessages: options => copyMessageRange(target, options),
+      getReplyMemory: index => readReplyMemory(target[index], adapter.messageFields) };
+    adapterPreparingOwner = adapter.id;
+    try { accept(adapter, await adapter.beforeSwitch?.(detail)); }
+    finally { adapterPreparingOwner = null; }
+    assertOwner();
+    nativePrepared.push(adapter);
+    if (change.fork && adapter.onFork) {
+      if (refreshTarget) {
+        const refreshed = await refreshTarget();
+        target = refreshed;
+        detail.getMessages = options => copyMessageRange(refreshed, options);
+      }
+      accept(adapter, await adapter.onFork(detail));
+    }
+    assertOwner();
+  }
+  return overrides;
+}
+
+async function completeNativeChange(change) {
+  const ctx = context();
+  const owner = { chat: ctx.chat, chatId: ctx.chatId, characterId: ctx.characterId };
+  const assertOwner = () => { const current = context(); if (current.chat !== owner.chat || current.chatId !== owner.chatId || current.characterId !== owner.characterId) throw Error("聊天已改变，停止旧路线的记忆恢复。"); };
+  for (const adapter of nativePrepared) {
+    adapterRecoveryOwner = adapter.id;
+    await adapter.afterSwitch?.(structuredClone(change));
+    assertOwner();
+  }
+  nativePrepared = [];
+  adapterRecoveryOwner = null;
+  adapterRecoveryKey = null;
+  // Hooks can persist their own data during restoration, as in ordinary chats.
+  await context().saveChat();
+  assertOwner();
+  state.routeSwitching = false;
+  emitBranchChanged(change);
+}
+
+async function abortNativeChange(change, opened) {
+  if (opened) { if (getActiveRouteInfo()?.branchId === change.branchId) adapterRecoveryKey = getActiveRouteKey(); return; }
+  const ctx = context();
+  if (nativeChangeOwner && (ctx.chat !== nativeChangeOwner.chat || ctx.chatId !== nativeChangeOwner.chatId || ctx.characterId !== nativeChangeOwner.characterId)) { nativePrepared = []; return; }
+  for (const adapter of nativePrepared.reverse()) {
+    try { await adapter.onSwitchAborted?.(getActiveRouteInfo()); }
+    catch (error) { console.error("[StoryBranchTree] Native switch recovery failed", error); }
+  }
+  nativePrepared = [];
+}
+
+async function runNative(action) {
+  if (state.busy || isGenerating()) throw Error("请等待当前操作结束。");
+  state.busy = true;
+  state.routeSwitching = true;
+  invalidateMemoryTasks();
+  const epoch = nativeStorage.epoch;
+  try {
+    const result = await action();
+    if (epoch !== nativeStorage.epoch) throw Error("剧情树已停用，已完成的文件操作可从原始记录查看。");
+    return result;
+  }
+  finally { if (epoch === nativeStorage.epoch) { state.busy = false; state.routeSwitching = false; refreshUi(); } }
 }
 
 function graphForApi(ctx) {
@@ -80,13 +217,14 @@ function routeInfo(ctx, tree, messages = ctx?.chat) {
   const chatId = ctx.chatId ?? null;
   return {
     version: 1,
+    ...(tree.storageMode === "native" ? { storageMode: "native", storyId: tree.storyId } : {}),
     chatId,
     characterId: ctx.characterId ?? null,
     rootBranchId: tree.rootBranchId,
     branchId: branch.id,
     parentBranchId: branch.parentBranchId ?? null,
     title: branch.title ?? "",
-    cacheKey: JSON.stringify([chatId, branch.id]),
+    cacheKey: JSON.stringify([tree.storageMode === "native" ? tree.storyId : chatId, branch.id]),
     messageCount: messages.length,
     messageIds: messages.map((message) => getStoryMessageId(message) ?? null),
   };
@@ -101,7 +239,7 @@ function getActiveRouteKey() {
   const ctx = context();
   const tree = graphForApi(ctx);
   return isSoloChat(ctx) && Array.isArray(ctx.chat) && tree?.branches?.[tree.activeBranchId]
-    ? JSON.stringify([ctx.chatId ?? null, tree.activeBranchId]) : null;
+    ? JSON.stringify([tree.storageMode === "native" ? tree.storyId : ctx.chatId ?? null, tree.activeBranchId]) : null;
 }
 
 function getRouteMessages(branchId, options = {}) {
@@ -111,6 +249,7 @@ function getRouteMessages(branchId, options = {}) {
   const targetBranchId = branchId ?? tree.activeBranchId;
   if (!tree.branches?.[targetBranchId]) return null;
   if (targetBranchId === tree.activeBranchId) return Array.isArray(ctx.chat) ? copyMessageRange(ctx.chat, options) : null;
+  if (tree.storageMode === "native") return null;
   return readStoryBranchMessages(tree, targetBranchId, options);
 }
 
@@ -124,6 +263,10 @@ function getRouteMetadata(adapterId, branchId) {
   const ctx = context();
   if (!isSoloChat(ctx)) return null;
   const tree = graphForApi(ctx);
+  if (tree?.storageMode === "native") {
+    if (branchId && branchId !== tree.activeBranchId) return null;
+    return structuredClone(Object.fromEntries(adapter.metadataFields.filter(key => Object.hasOwn(ctx.chatMetadata, key)).map(key => [key, ctx.chatMetadata[key]])));
+  }
   const saved = tree?.branches?.[branchId ?? tree.activeBranchId]?.adapterStates?.[adapterId]?.metadata;
   return saved === undefined ? null : structuredClone(saved);
 }
@@ -197,8 +340,10 @@ function notifyMemoryChanged(adapterId, options = {}) {
   if (!isSoloChat(ctx) || !tree) throw new Error("当前路线尚未就绪，不能保存记忆变更。");
   const read = messageReadOptions(options, ctx.chat.length);
   if (read.from === read.to && (!adapter.metadataFields.length || options.metadata === false)) return;
-  captureStoryBranchAdapterState(tree, tree.activeBranchId, ctx.chat.slice(read.from, read.to), adapterId, adapter.messageFields, { partial: true });
-  if (options.metadata !== false) captureAdapterMetadata(ctx, tree, tree.activeBranchId, adapter);
+  if (tree.storageMode !== "native") {
+    captureStoryBranchAdapterState(tree, tree.activeBranchId, ctx.chat.slice(read.from, read.to), adapterId, adapter.messageFields, { partial: true });
+    if (options.metadata !== false) captureAdapterMetadata(ctx, tree, tree.activeBranchId, adapter);
+  }
   adapter.memoryRevision++;
   for (const task of [...memoryTasks]) if (task.adapterId === adapterId) {
     if (task.token === options.task) task.advanceRevision();
@@ -214,7 +359,7 @@ function installPublicApi() {
   }
   const api = Object.freeze({
     version: 1,
-    capabilities: Object.freeze({ rangedMessages: true, memoryTasks: true, forkHooks: true, explicitSnapshots: true, metadataSnapshots: true, routeList: true }),
+    capabilities: Object.freeze({ rangedMessages: true, memoryTasks: true, forkHooks: true, explicitSnapshots: true, metadataSnapshots: true, routeList: true, nativeStorage: true, replyMemory: true }),
     eventName: BRANCH_CHANGED_EVENT,
     getActiveRoute: () => publicApi === api ? getActiveRouteInfo() : null,
     getActiveRouteKey: () => publicApi === api ? getActiveRouteKey() : null,
@@ -227,6 +372,26 @@ function installPublicApi() {
     },
     getRouteMessages: (branchId, options) => publicApi === api ? getRouteMessages(branchId, options) : null,
     getRouteMetadata: (id, branchId) => publicApi === api ? getRouteMetadata(id, branchId) : null,
+    getReplyMemory: (id, index, options) => {
+      if (publicApi !== api) return null;
+      const adapter = routeAdapters.get(id);
+      if (!adapter) throw Error("记忆适配器未注册。");
+      return readReplyMemory(context()?.chat?.[index], adapter.messageFields, options);
+    },
+    captureReplyMemory: (id, index) => {
+      if (publicApi !== api) throw Error("路线记忆接口已停用。");
+      const adapter = routeAdapters.get(id), ctx = context();
+      if (!adapter) throw Error("记忆适配器未注册。");
+      if (!isSoloChat(ctx) || state.routeSwitching && adapterPreparingOwner !== id || isMemoryBlocked(ctx)) throw Error("当前聊天尚未就绪，不能保存回复记忆。");
+      captureReplyMemory(ctx.chat[index], adapter.messageFields);
+    },
+    restoreReplyMemory: (id, index) => {
+      if (publicApi !== api) throw Error("路线记忆接口已停用。");
+      const adapter = routeAdapters.get(id), ctx = context();
+      if (!adapter) throw Error("记忆适配器未注册。");
+      if (!isSoloChat(ctx) || state.routeSwitching && adapterRecoveryOwner !== id) throw Error("当前聊天尚未就绪，不能恢复回复记忆。");
+      return restoreReplyMemory(ctx.chat[index], adapter.messageFields);
+    },
     registerRouteAdapter: (adapter) => publicApi === api ? registerRouteAdapter(adapter) : () => {},
     beginMemoryTask: (id, options) => { if (publicApi !== api) throw new Error("路线记忆接口已停用。"); return beginMemoryTask(id, options); },
     notifyMemoryChanged: (id, options) => { if (publicApi !== api) throw new Error("路线记忆接口已停用。"); return notifyMemoryChanged(id, options); },
@@ -262,7 +427,7 @@ function registerRouteAdapter(adapter) {
     present: Object.hasOwn(branch, "adapterStates"), value: branch.adapterStates,
   }]));
   try {
-    if (isSoloChat(ctx) && tree) {
+    if (isSoloChat(ctx) && tree && tree.storageMode !== "native") {
       initializeRegisteredAdapterStates(tree, [entry]);
       captureStoryBranchAdapterState(tree, tree.activeBranchId, ctx.chat, entry.id, entry.messageFields);
       captureAdapterMetadata(ctx, tree, tree.activeBranchId, entry);
@@ -286,6 +451,7 @@ function registerRouteAdapter(adapter) {
 }
 
 function initializeRegisteredAdapterStates(tree, entries = routeAdapters.values()) {
+  if (tree.storageMode === "native") return;
   for (const entry of entries) {
     for (const branchId of Object.keys(tree.branches)) {
       if (branchId !== tree.activeBranchId && !tree.branches[branchId].adapterStates?.[entry.id]) {
@@ -297,6 +463,10 @@ function initializeRegisteredAdapterStates(tree, entries = routeAdapters.values(
 }
 
 function removePublicApi() {
+  memoryEnhancementDispose?.();
+  memoryEnhancementDispose = null;
+  memoryEnhancementAttempt = null;
+  adapterPreparingOwner = null;
   invalidateMemoryTasks();
   if (publicApi && globalThis[PUBLIC_API_KEY] === publicApi) delete globalThis[PUBLIC_API_KEY];
   publicApi = null;
@@ -342,6 +512,7 @@ function emitBranchChanged(detail) {
 }
 
 function storeGraph(ctx, tree) {
+  if (tree.storageMode === "native") { nativeStorage.saveView(tree); return; }
   ctx.updateChatMetadata({ [TREE_METADATA_KEY]: tree });
   ctx.saveMetadataDebounced?.();
 }
@@ -436,6 +607,7 @@ function routeUsesReply(tree, branchId, sourceId, floorIndex, versionId, version
 }
 
 function branchMessageIndex(tree, branch) {
+  if (tree.storageMode === "native") return branch.legacyForkUnknown ? null : branch.forkFloor - 1;
   if (!branch.parentBranchId) return null;
   const parent = readStoryBranchMessages(tree, branch.parentBranchId, { fields: ["extra.story_branch_tree_message_id"] });
   return parent.findIndex((message) => getStoryMessageId(message) === branch.forkMessageId);
@@ -455,6 +627,7 @@ function groupForkPoints(branches) {
       sourceMessageId: branch.sourceMessageId,
       nodeKey: branch.nodeKey,
       kind: branch.kind,
+      unknown: Boolean(branch.legacyForkUnknown),
       forkIndex: branch.displayForkIndex,
       children: [],
       depth: branch.depth ?? 0,
@@ -484,18 +657,20 @@ function sortForkPointsByFloor(groups) {
 
 function readRouteFloor(tree, branchId, index) {
   if (!Number.isSafeInteger(index) || index < 0) return undefined;
+  if (tree.storageMode === "native") return branchId === tree.activeBranchId ? context().chat[index] : undefined;
   return readStoryBranchMessages(tree, branchId, { from: index, to: index + 1 })[0];
 }
 
 function forkPointMessage(tree, group) {
+  if (tree.storageMode === "native") return group.children[0]?.forkSnapshot;
   if (group.kind === "swipe") return readRouteFloor(tree, group.parentBranchId, group.forkIndex)
     ?? tree.messages[group.sourceMessageId];
   return group.children[0]?.forkSnapshot ?? tree.messages[group.forkMessageId];
 }
 
 function forkPointText(tree, group) {
-  const floor = group.forkIndex + 1;
-  const fallback = `第 ${floor} 楼${group.kind === "swipe" ? "回复选择" : "分叉点"}`;
+  const floor = group.unknown ? "?" : group.forkIndex + 1;
+  const fallback = group.unknown ? "分叉位置未知" : `第 ${floor} 楼${group.kind === "swipe" ? "回复选择" : "分叉点"}`;
   const legacyKey = group.kind === "continuation" ? group.forkMessageId : null;
   const sourceMessage = forkPointMessage(tree, group);
   const replyIndex = sourceMessage?.swipe_id;
@@ -534,7 +709,8 @@ function planTreeColumns(rootBranchId, groupsByParent, branchWidth, stemGap, sib
     reaches.set(branchId, outerEdge);
     return outerEdge;
   };
-  reach(rootBranchId);
+  const rootIds = Array.isArray(rootBranchId) ? rootBranchId : [rootBranchId];
+  rootIds.forEach(id => reach(id));
 
   const offsets = new Map();
   let leftExtent = halfWidth;
@@ -559,7 +735,7 @@ function planTreeColumns(rootBranchId, groupsByParent, branchWidth, stemGap, sib
       for (const child of group.children) assign(child.id, side, nextAncestors);
     }
   };
-  assign(rootBranchId, 0);
+  rootIds.forEach(id => assign(id, 0));
   return {
     groupsFor,
     leftExtent,
@@ -710,14 +886,15 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
   const rowGap = narrow ? 170 : 192;
   const pointSize = 56;
   const rootBranch = branches.find((branch) => branch.id === tree.rootBranchId);
-  if (!rootBranch || !groups.length) {
+  if (!rootBranch || !groups.length && branches.length === 1) {
     empty.hidden = false;
     empty.textContent = "当前剧情树还没有分叉点。";
     world.replaceChildren();
     renderedLayout = null;
     return;
   }
-  const columns = planTreeColumns(rootBranch.id, groupsByParent, 220, narrow ? 38 : 46, narrow ? 44 : 56);
+  const roots = branches.filter(branch => !branch.parentBranchId);
+  const columns = planTreeColumns(roots.map(branch => branch.id), groupsByParent, 220, narrow ? 38 : 46, narrow ? 44 : 56);
   const sortedGroups = columns.groupsFor;
   const routeStarts = new Map();
   const layoutRoute = (branchId, axis, top, depth, seen = new Set()) => {
@@ -752,7 +929,7 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
     return Math.max(subtreeBottom, leaves.get(branchId).y + 120);
   };
   const rootAxis = Math.max(columns.leftExtent + 40, canvas.clientWidth / 2);
-  layoutRoute(rootBranch.id, rootAxis, 44, 0);
+  roots.forEach((branch, index) => layoutRoute(branch.id, rootAxis + index * (columns.leftExtent + columns.rightExtent + 100), 44, 0));
   const routeLaneMarkup = () => {
     const lanes = [];
     for (const [branchId, branchGroups] of groupsByParent) {
@@ -762,7 +939,7 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
       if (!branch || !leaf) continue;
       if (!branch.parentBranchId) {
         const start = routeStarts.get(branchId);
-        lanes.push(`<g class="story-branch-tree__compact-terminal"><circle cx="${start.x}" cy="${start.y}" r="26" /><text x="${start.x}" y="${start.y}">起点</text></g>`);
+        lanes.push(`<g class="story-branch-tree__compact-terminal"><circle cx="${start.x}" cy="${start.y}" r="26" /><text x="${start.x}" y="${start.y}">${branch.legacyParentUnavailable ? "来源缺失" : "起点"}</text></g>`);
       }
       const spineNodes = laneGroups.map((group) => points.get(group.id));
       if (!branch.parentBranchId) spineNodes.unshift({ x: routeStarts.get(branchId).x - pointSize / 2, y: routeStarts.get(branchId).y - pointSize / 2 });
@@ -778,7 +955,8 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
         if (!branch.parentBranchId && index === Math.min(2, spineNodes.length - 1)) {
           const labelX = (x1 + x2) / 2 + 12;
           const labelY = (y1 + y2) / 2 - 12;
-          lanes.push(`<g class="story-branch-tree__compact-label-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branchId)}" role="button" tabindex="0" aria-current="${branchId === tree.activeBranchId}" aria-label="切换到主线"><rect class="story-branch-tree__compact-label-bg" x="${labelX}" y="${labelY}" width="50" height="24" rx="8" /><text class="story-branch-tree__compact-label" x="${labelX + 25}" y="${labelY + 12}">主线</text><title>点击切换到主线</title></g>`);
+          const rootLabel = roots.length > 1 ? `路线 ${branch.branchNumber}` : "主线";
+          lanes.push(`<g class="story-branch-tree__compact-label-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branchId)}" role="button" tabindex="0" aria-current="${branchId === tree.activeBranchId}" aria-label="切换到${escapeAttribute(rootLabel)}"><rect class="story-branch-tree__compact-label-bg" x="${labelX}" y="${labelY}" width="70" height="24" rx="8" /><text class="story-branch-tree__compact-label" x="${labelX + 35}" y="${labelY + 12}">${escapeHtml(rootLabel)}</text><title>点击切换到${escapeHtml(rootLabel)}</title></g>`);
         }
       }
       const tail = branchEnds.get(branchId);
@@ -894,9 +1072,11 @@ function renderTree() {
     status.textContent = current.pendingSwipe
       ? `第 ${current.sourceSwipeIndex + 1} 个回复待续 · 发送下一楼后加入剧情树 · ${branches.length} 条路线`
       : `当前路线：${branchNumbers.get(current.id) ?? "1"} · ${currentTitle} · ${branches.length} 条路线`;
+    if (tree.storageMode === "native") status.textContent = "原生分支 · " + status.textContent;
     const groups = groupForkPoints(branches);
     if (focusButton && compactView) focusButton.disabled = current.pendingSwipe || groups.length === 0;
     const branchEnds = new Map(branches.map((branch) => {
+      if (tree.storageMode === "native") return [branch.id, { floor: branch.endFloor, summary: branch.endSummary ?? "" }];
       const lastId = branch.messageIds.at(-1);
       const last = lastId ? tree.messages[lastId] : branch.forkSnapshot;
       const floor = branch.parentBranchId ? branch.forkIndex + 1 + branch.messageIds.length : branch.messageIds.length;
@@ -919,7 +1099,8 @@ function renderTree() {
     const hubHeight = 88;
     const rootBranch = branches.find((branch) => branch.id === tree.rootBranchId);
     if (!rootBranch) throw new Error("剧情树缺少主线。");
-    const columns = planTreeColumns(rootBranch.id, groupsByParent, cardWidth, narrow ? 72 : 108, narrow ? 72 : 108);
+    const roots = branches.filter(branch => !branch.parentBranchId);
+    const columns = planTreeColumns(roots.map(branch => branch.id), groupsByParent, cardWidth, narrow ? 72 : 108, narrow ? 72 : 108);
     const hubWidth = 76;
     const rootAxis = Math.max(columns.leftExtent + 40, canvas.clientWidth / 2);
     const placeRoute = (branch, axis, top, seen = new Set()) => {
@@ -945,7 +1126,7 @@ function renderTree() {
       if (lastHubY !== null) subtreeBottom = Math.max(subtreeBottom, lastHubY + hubHeight + 78 + 104);
       return subtreeBottom;
     };
-    placeRoute(rootBranch, rootAxis, 32);
+    roots.forEach((branch, index) => placeRoute(branch, rootAxis + index * (columns.leftExtent + columns.rightExtent + 100), 32));
     for (const branch of branches) {
       const saved = tree.layout?.[branch.id];
       const position = positions.get(branch.id);
@@ -970,16 +1151,16 @@ function renderTree() {
       const disabled = state.busy || isGenerating();
       const forkPointName = branch.parentBranchId
         ? (tree.nodeNames?.[branch.nodeKey] ?? tree.nodeNames?.[branch.kind === "continuation" ? branch.forkMessageId : null])?.trim()
-          || `第 ${branch.displayForkIndex + 1} 楼${branch.kind === "swipe" ? "回复选择" : "分叉点"}`
-        : "剧情起点";
-      const nextFloor = branch.parentBranchId && Number.isInteger(branch.forkIndex) ? branch.forkIndex + 2 : null;
-      const summaryLabel = nextFloor === null ? "主线" : branch.kind === "swipe"
+          || (branch.legacyForkUnknown ? "分叉位置未知" : `第 ${branch.displayForkIndex + 1} 楼${branch.kind === "swipe" ? "回复选择" : "分叉点"}`)
+        : branch.legacyParentUnavailable ? `来源未找到：${branch.legacyParentName}` : "剧情起点";
+      const nextFloor = branch.parentBranchId && !branch.legacyForkUnknown && Number.isInteger(branch.forkIndex) ? branch.forkIndex + 2 : null;
+      const summaryLabel = nextFloor === null ? branch.legacyParentUnavailable ? "现存路线" : branch.legacyForkUnknown ? "旧分支 · 位置未知" : "主线" : branch.kind === "swipe"
         ? `第 ${nextFloor} 楼 · ${branch.sourceVariantPresent ? "回复" : "原回复"} ${Number.isInteger(branch.replyIndex) ? branch.replyIndex + 1 : "另一版"}`
         : `第 ${nextFloor} 楼 · 分支摘要`;
       const nextMessage = branch.messageIds.length ? tree.messages[branch.messageIds[0]] : null;
       const summaryText = branch.parentBranchId
-        ? branch.summary?.trim() || messageExcerpt(nextMessage) || (branch.messageIds.length ? "无摘要" : "该楼层还未出现 · 无摘要")
-        : "主线";
+        ? branch.summary?.trim() || (tree.storageMode === "native" ? branch.endSummary : messageExcerpt(nextMessage)) || (branch.messageIds.length ? "无摘要" : "该楼层还未出现 · 无摘要")
+        : branch.legacyParentUnavailable ? branch.endSummary || "现存路线" : "主线";
       return `<article class="story-branch-tree__card${narrow ? " is-narrow" : ""}" data-branch-id="${escapeAttribute(branch.id)}" data-kind="${branch.kind}" style="left:${position.x}px;top:${position.y}px;width:${position.width}px" aria-current="${active}">
         <div class="story-branch-tree__card-heading">
           <button class="story-branch-tree__route-button" data-action="confirm-branch-switch" data-branch-id="${escapeAttribute(branch.id)}" type="button" ${(active && !isMemoryBlocked(ctx)) || disabled ? "disabled" : ""} title="切换到路线 ${escapeAttribute(branch.branchNumber)}：${escapeAttribute(branch.title)}"><span class="story-branch-tree__route-number">${branch.kind === "swipe" ? "重说" : "路线"} ${escapeHtml(branch.branchNumber)}</span> ${escapeHtml(branch.title)}</button>
@@ -1002,7 +1183,7 @@ function renderTree() {
         <button class="story-branch-tree__fork-point" data-action="edit-node-note" data-branch-id="${escapeAttribute(branchId)}" type="button" ${disabled ? "disabled" : ""} aria-label="查看和编辑第 ${forkFloor} 楼${group.kind === "swipe" ? "重说回复组" : "分叉点"}：${escapeAttribute(pointName)}" title="${escapeAttribute(`${pointName}：${pointSummary}；鼠标拖动，触屏长按后拖动，点击编辑`)}">
           ${glyph}
         </button>
-        ${group.kind === "swipe" ? "" : `<button class="story-branch-tree__fork-create" data-action="return-to-node" data-branch-id="${escapeAttribute(branchId)}" type="button" ${disabled ? "disabled" : ""} aria-label="从第 ${forkFloor} 楼分叉点继续" title="从此处分支">＋</button>`}
+        ${group.kind === "swipe" || group.unknown ? "" : `<button class="story-branch-tree__fork-create" data-action="return-to-node" data-branch-id="${escapeAttribute(branchId)}" type="button" ${disabled ? "disabled" : ""} aria-label="从第 ${forkFloor} 楼分叉点继续" title="从此处分支">＋</button>`}
       </article>`;
     }).join("");
     const endings = branches.map((branch) => {
@@ -1165,12 +1346,164 @@ function updatePinchGesture(canvas) {
   applyView();
 }
 
+function requestStoryMode(action) {
+  const ctx = context();
+  if (storyMode(ctx)) return false;
+  pendingModeAction = { chat: ctx.chat, chatId: ctx.chatId, characterId: ctx.characterId, action };
+  openTree();
+  return true;
+}
+
+async function chooseStoryMode(mode) {
+  const ctx = context();
+  const owner = { chat: ctx.chat, chatId: ctx.chatId, characterId: ctx.characterId };
+  const request = pendingModeAction;
+  if (state.busy || isGenerating()) throw Error("请等待当前操作结束。");
+  if (request && (ctx.chat !== request.chat || ctx.chatId !== request.chatId || ctx.characterId !== request.characterId)) throw Error("聊天已改变，请重新选择故事模式。");
+  if (storyMode(ctx)) throw Error("当前故事的模式已经固定。");
+  if (mode === "native") await runNative(() => nativeStorage.initialize());
+  else {
+    ctx.updateChatMetadata({ [MODE_KEY]: "single" });
+    await ctx.saveChat();
+  }
+  const current = context();
+  if (current.chat !== owner.chat || current.chatId !== owner.chatId || current.characterId !== owner.characterId) throw Error("聊天已改变，旧故事模式已保存，请重新打开当前故事。");
+  pendingModeAction = null;
+  document.querySelector('#story-branch-tree [data-role="mode-picker"]').hidden = true;
+  refreshUi();
+  request?.action?.();
+}
+
+async function openStoryLibrary(rebuild = false) {
+  if (state.busy || isGenerating()) throw Error("请等待当前操作结束。");
+  const ctx = context();
+  if (!isSoloChat(ctx)) throw Error("请先打开单人角色聊天。");
+  legacySearch?.abort();
+  legacyPlan = null;
+  libraryEntries = await nativeStorage.listStories({ rebuild });
+  openTree();
+  const root = document.getElementById("story-branch-tree");
+  root.classList.add("is-library");
+  root.querySelector('[data-role="status"]').textContent = `故事与聊天 · ${libraryEntries.length} 项`;
+  root.querySelector('[data-role="mode-picker"]').hidden = true;
+  root.querySelector('[data-role="canvas"]').hidden = true;
+  const library = root.querySelector('[data-role="story-library"]');
+  library.hidden = false;
+  library.innerHTML = `<p>同一原生故事归为一项。“查找整个故事”可从当前聊天找回旧原生分支；“重建分组”恢复已有故事标记的记录。</p><div class="story-branch-tree__library-tools">${storyMode(ctx) !== "single" ? '<button data-action="legacy-find">从当前聊天查找整个故事</button>' : ""}<button data-action="library-rebuild">重建分组</button><button data-action="library-original">查看原始记录</button><button data-action="import-story">导入故事</button>${storyMode(ctx) === "native" ? '<button data-action="export-route">导出当前路线</button>' : ""}</div>`
+    + libraryEntries.map((entry, index) => `<article class="story-branch-tree__library-entry"><h3>${escapeHtml(entry.title)}</h3><p>${entry.routes.length} 条${entry.storyId ? "原生路线" : "聊天记录"}</p><div><button data-action="library-open" data-entry="${index}">继续</button>${entry.storyId ? `<button data-action="library-routes" data-entry="${index}">查看路线</button><button data-action="library-export" data-entry="${index}">导出故事</button><button data-action="library-delete" data-entry="${index}">删除故事</button>` : ""}</div><div data-role="library-routes" hidden>${entry.routes.map(route => `<button data-action="library-chat" data-chat-name="${escapeAttribute(route.chatName)}">${escapeHtml(route.title)}</button>`).join("")}</div></article>`).join("");
+}
+
+async function findLegacyStory() {
+  await openStoryLibrary();
+  const controller = legacySearch = new AbortController();
+  const library = document.querySelector('#story-branch-tree [data-role="story-library"]');
+  library.innerHTML = '<h3>查找整个故事</h3><p data-role="legacy-progress" aria-live="polite">正在查找…</p><button data-action="legacy-cancel">取消查找</button>';
+  const progress = text => { const el = library.querySelector('[data-role="legacy-progress"]'); if (el) el.textContent = text; };
+  try {
+    const plan = await runNative(() => nativeStorage.discoverLegacyStory({ signal: controller.signal, onProgress: progress }));
+    if (controller.signal.aborted) return;
+    legacyPlan = plan;
+    document.querySelector('#story-branch-tree [data-role="status"]').textContent = "旧原生分支 · 整理预览";
+    const usable = plan.rows.filter(row => !row.blocked).length;
+    const alreadyGrouped = !plan.rows.some(row => !row.blocked && !row.existing);
+    library.innerHTML = `<h3>找到 ${usable} 条可整理记录</h3><p>故事：${escapeHtml(plan.title)}</p><p>核对后选择要归组的记录。各聊天文件和记忆仍分别保留；不会补回过去未保存的记忆。</p>`
+      + (plan.missing.length ? `<p>未找到来源聊天：${plan.missing.map(escapeHtml).join("、")}。可以整理现存分支，无法恢复已删正文。</p>` : "")
+      + plan.rows.map(row => `<label class="story-branch-tree__legacy-row"><input type="checkbox" data-role="legacy-choice" value="${escapeAttribute(row.chatName)}" ${!row.blocked && (!row.checkpoint || row.chatName === context().chatId || row.existing) ? "checked" : ""} ${row.blocked || row.existing || row.chatName === context().chatId ? "disabled" : ""}><span><strong>${escapeHtml(row.chatName)}</strong><small>${escapeHtml(row.blocked || `${row.messageCount} 楼 · ${row.existing ? "已归组" : row.checkpoint ? "原生检查点（可选）" : row.parentName ? `来源：${row.parentName} · ${row.floor ? `第 ${row.floor} 楼分叉` : "分叉位置未知"}` : "来源起点"}`)}</small></span></label>`).join("")
+      + `<p data-role="legacy-progress" aria-live="polite">${usable < 2 ? "没有找到其他可归组记录。若文件改名或来源关联丢失，目前无法自动找全。" : alreadyGrouped ? "这些记录已归为同一故事，无需重复整理。" : "只按明确来源关联查找，不根据相似名称收录聊天。"}</p><div class="story-branch-tree__library-tools"><button data-action="legacy-accept" ${usable < 2 || alreadyGrouped ? "disabled" : ""}>整理所选记录</button><button data-action="legacy-cancel">返回列表</button></div>`;
+  } catch (error) {
+    if (!controller.signal.aborted) { progress(error.message); throw error; }
+    progress("已取消查找，未整理任何记录。");
+    const back = library.querySelector('[data-action="legacy-cancel"]'); if (back) back.textContent = "返回列表";
+  } finally { if (legacySearch === controller) legacySearch = null; }
+}
+
+async function openLibraryChat(chatName) {
+  const owner = { chatId: context().chatId, characterId: context().characterId };
+  await runNative(async () => {
+    if (storyMode(context()) === "native") {
+      const target = Object.values(nativeStorage.view().branches).find(route => route.chatName === chatName);
+      if (target) { await nativeStorage.switchRoute(target.id); return; }
+    }
+    await context().saveChat();
+    if (context().chatId !== owner.chatId || context().characterId !== owner.characterId) throw Error("聊天已改变，请重新打开列表。");
+    // Crossing stories is an ordinary chat load; its normal listeners may
+    // start work once the host has loaded the target chat.
+    state.routeSwitching = false;
+    await context().openCharacterChat(chatName);
+    if (context().chatMetadata[NATIVE_KEY]) nativeStorage.syncCurrent();
+  });
+  closeTree();
+}
+
+function downloadStory(data, filename, type = "application/json") {
+  const url = URL.createObjectURL(new Blob([data], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+async function exportNativeStory(all = true, storyId) {
+  await runNative(async () => {
+    const bundle = await nativeStorage.exportStory(all, storyId);
+    const filename = String(bundle.title).replace(/[<>:"/\\|?*]/g, "_");
+    const records = bundle.chats[0].records;
+    if (!all) {
+      delete records[0].chat_metadata[NATIVE_KEY];
+      delete records[0].chat_metadata.main_chat;
+    }
+    downloadStory(all ? JSON.stringify(bundle) : records.map(record => JSON.stringify(record)).join("\n"),
+      `${filename}${all ? ".story.json" : ".jsonl"}`, all ? "application/json" : "application/jsonl");
+  });
+}
+
+function showNativeReply(index, swipeId) {
+  const ctx = context();
+  const message = ctx.chat[index];
+  if (!canForkCurrentSwipe(message) || typeof message.swipes[swipeId] !== "string") throw Error("重说回复不存在。");
+  nativePreview = { chat: ctx.chat, chatId: ctx.chatId, message, index, swipeId,
+    variantId: replyVersionId(message, swipeId), text: swipeId === (message.swipe_id ?? 0) ? message.mes : message.swipes[swipeId] };
+  const detail = document.querySelector('#story-branch-tree [data-role="floor-detail"]');
+  openTree();
+  detail.querySelector('[data-role="floor-title"]').textContent = `第 ${index + 1} 楼 · 回复 ${swipeId + 1}/${message.swipes.length}（预览）`;
+  detail.querySelector('[data-role="floor-content"]').textContent = nativePreview.text;
+  const routes = nativeStorage.replyRoutes(index, swipeId);
+  detail.querySelector('[data-role="reply-actions"]').innerHTML = `<button data-action="reply-previous">上一回复</button><button data-action="reply-next">下一回复</button><button data-action="reply-create">新建路线并继续</button>`
+    + routes.map(entry => `<button data-action="reply-existing" data-branch-id="${escapeAttribute(entry.route.id)}">继续：${escapeHtml(entry.route.title)}</button>`).join("");
+  detail.hidden = false;
+}
+
+function checkedNativePreview() {
+  const ctx = context();
+  const preview = nativePreview;
+  if (!preview || ctx.chat !== preview.chat || ctx.chatId !== preview.chatId || ctx.chat[preview.index] !== preview.message
+    || replyVersionId(preview.message, preview.swipeId) !== preview.variantId
+    || (preview.swipeId === (preview.message.swipe_id ?? 0) ? preview.message.mes : preview.message.swipes[preview.swipeId]) !== preview.text) throw Error("预览回复已改变，请重新打开。");
+  return preview;
+}
+
+function closeFloorDetail() {
+  const detail = document.querySelector('#story-branch-tree [data-role="floor-detail"]');
+  if (detail) {
+    detail.hidden = true;
+    detail.querySelector('[data-role="floor-content"]').textContent = "";
+    detail.querySelector('[data-role="reply-actions"]')?.replaceChildren();
+  }
+  nativePreview = null;
+}
+
 function openTree() {
   const panel = document.getElementById("story-branch-tree");
   if (!panel) return;
+  panel.classList.remove("is-library");
   const toggle = panel.querySelector('[data-action="toggle-view"]');
   updateViewToggle(toggle);
   panel.hidden = false;
+  panel.querySelector('[data-role="story-library"]')?.setAttribute("hidden", "");
+  panel.querySelector('[data-role="canvas"]')?.removeAttribute("hidden");
+  const picker = panel.querySelector('[data-role="mode-picker"]');
+  if (picker) picker.hidden = Boolean(storyMode(context()));
   document.body.classList.add("story-branch-tree-open");
   view.needsFit = true;
   renderTree();
@@ -1189,10 +1522,12 @@ function updateViewToggle(button) {
 }
 
 function closeTree() {
+  legacySearch?.abort();
+  legacyPlan = null;
   const panel = document.getElementById("story-branch-tree");
   if (!panel) return;
   closeConfirmation();
-  panel.querySelector('[data-role="floor-detail"]')?.setAttribute("hidden", "");
+  closeFloorDetail();
   panel.hidden = true;
   document.body.classList.remove("story-branch-tree-open");
 }
@@ -1242,6 +1577,7 @@ function openMessageForkConfirm(messageIndex) {
   const ctx = context();
   if (!isSoloChat(ctx)) throw new Error("只支持单人角色聊天。");
   if (!Number.isInteger(messageIndex) || !ctx.chat[messageIndex]) throw new Error("分支消息不存在。");
+  if (requestStoryMode(() => openMessageForkConfirm(messageIndex))) return;
   openConfirmation({ kind: "fork-message", messageIndex, messageRef: ctx.chat[messageIndex] }, "创建剧情分支", `从第 ${messageIndex + 1} 楼创建一条新路线吗？当前路线的后续会保留。`, "确认创建");
 }
 
@@ -1258,6 +1594,7 @@ function openSwipeBranchConfirm(messageIndex) {
   const message = ctx.chat[messageIndex];
   const anchor = ctx.chat[messageIndex - 1];
   if (!anchor || !canForkCurrentSwipe(message)) throw new Error("这条 AI 回复没有可用的当前重说版本。");
+  if (requestStoryMode(() => openSwipeBranchConfirm(messageIndex))) return;
   const activeSwipeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
   openConfirmation({
     kind: "fork-swipe",
@@ -1281,7 +1618,7 @@ function openNodeForkConfirm(branchId) {
   const row = getStoryBranchRows(tree).find((item) => item.id === branchId);
   if (row?.kind === "swipe") throw new Error("重说回复组请从聊天楼层的重说版本创建新路线。");
   const forkIndex = branchMessageIndex(tree, branch);
-  if (forkIndex < 0) throw new Error("找不到分叉点对应的楼层。");
+  if (!Number.isInteger(forkIndex) || forkIndex < 0) throw new Error("这条旧分支没有保留准确分叉位置，请从聊天中的具体楼层开新分支。");
   const floor = forkIndex + 1;
   openConfirmation({ kind: "fork-node", branchId }, "从分叉点继续", `从第 ${floor} 楼“${tree.nodeNames?.[branch.forkMessageId] || "分叉点"}”创建新路线吗？原有路线会保留。`, "确认创建");
 }
@@ -1292,6 +1629,12 @@ function openDeleteBranchConfirm(branchId) {
   if (!isSoloChat(ctx)) throw new Error("只支持单人角色聊天。");
   const tree = graphFrom(ctx);
   if (!tree) throw new Error("当前聊天尚未建立剧情树。");
+  if (tree.storageMode === "native") {
+    if (branchId === tree.rootBranchId) throw Error("请从故事列表删除整个故事。");
+    const row = getStoryBranchRows(tree).find(route => route.id === branchId);
+    openConfirmation({ kind: "delete", branchId }, "删除原生路线", `删除「${row?.title ?? branchId}」及其子路线对应的聊天文件吗？其他路线保留。`, "确认删除");
+    return;
+  }
   const next = deleteStoryBranch(tree, branchId);
   const descendants = Object.keys(tree.branches).length - Object.keys(next.branches).length - 1;
   const row = getStoryBranchRows(tree).find((item) => item.id === branchId);
@@ -1310,6 +1653,24 @@ async function confirmPendingAction() {
   if (request.kind === "switch") {
     await activateBranch(request.branchId);
     closeTree();
+  } else if (request.kind === "native-reply") {
+    const preview = checkedNativePreview();
+    await forkFromSwipe(preview.index, preview.swipeId);
+    closeFloorDetail();
+  } else if (request.kind === "adopt-legacy") {
+    const result = await runNative(() => nativeStorage.adoptLegacyStory(request.plan, request.names, { onProgress: text => {
+      const el = document.querySelector('#story-branch-tree [data-role="legacy-progress"]'); if (el) el.textContent = text;
+    } }));
+    pendingModeAction = null;
+    await openStoryLibrary();
+    toast("success", `已将 ${result.count} 条记录整理为一个故事。`);
+  } else if (request.kind === "delete-story") {
+    await runNative(() => nativeStorage.removeStory(request.storyId, async () => {
+      const core = await import("../../../../script.js");
+      if (typeof core.doNewChat !== "function") throw Error("当前酒馆无法安全离开故事，请先打开其他聊天再删除。");
+      await core.doNewChat();
+    }, request.files));
+    await openStoryLibrary();
   } else if (request.kind === "fork-message") {
     if (ctx.chat[request.messageIndex] !== request.messageRef) throw new Error("这条消息已改变，请重新点击分支。");
     await forkFromMessage(request.messageIndex);
@@ -1344,13 +1705,17 @@ async function confirmPendingAction() {
   }
 }
 
-function showEndDetail(branchId) {
+async function showEndDetail(branchId) {
   const tree = graphFrom(context());
   const branch = tree?.branches?.[branchId];
   const panel = document.getElementById("story-branch-tree");
   const detail = panel?.querySelector('[data-role="floor-detail"]');
   if (!branch || !detail) throw new Error("找不到这条路线的终点。");
-  const route = resolveStoryBranch(tree, branchId);
+  const owner = context().chat;
+  const chatId = context().chatId;
+  const route = tree.storageMode === "native" ? await nativeStorage.readRoute(branchId) : resolveStoryBranch(tree, branchId);
+  if (context().chat !== owner || context().chatId !== chatId) throw Error("聊天已改变，请重新打开详情。");
+  closeFloorDetail();
   const title = getStoryBranchRows(tree).find((row) => row.id === branchId)?.title ?? branch.title;
   detail.querySelector('[data-role="floor-title"]').textContent = `${title} · 第 ${route.length || "—"} 楼`;
   detail.querySelector('[data-role="floor-content"]').textContent = messageContent(route.at(-1)) || "该楼层还没有内容。";
@@ -1425,7 +1790,7 @@ function renderForkButtons() {
   const enabled = isSoloChat(ctx);
   const tree = enabled ? graphFrom(ctx) : null;
   const replyAliases = new Map();
-  if (tree) {
+  if (tree && tree.storageMode !== "native") {
     for (let branch = tree.branches[tree.activeBranchId]; branch; branch = tree.branches[branch.parentBranchId]) {
       const sourceId = sourceMessageIdForBranch(tree, branch);
       if (!sourceId || !branch.messageIds[0]) continue;
@@ -1512,6 +1877,7 @@ function renderForkButtons() {
 }
 
 function refreshUi({ chatButtons = true } = {}) {
+  if (!extensionEnabled) return;
   if (!document.getElementById("story-branch-tree")?.hidden) renderTree();
   if (chatButtons) renderForkButtons();
 }
@@ -1525,7 +1891,7 @@ async function autoArrangeTree() {
   delete tree.layout;
   delete tree.compactLayout;
   storeGraph(ctx, tree);
-  await ctx.saveChat?.();
+  if (tree.storageMode !== "native") await ctx.saveChat?.();
   view.needsFit = true;
   renderTree();
 }
@@ -1555,6 +1921,7 @@ function applySyncedMessageIds(liveMessages, syncedMessages) {
 function syncLiveChat({ allowInitialize = false } = {}) {
   const ctx = context();
   if (!isSoloChat(ctx)) return null;
+  if (storyMode(ctx) === "native") return nativeStorage.syncCurrent();
   let tree = graphFrom(ctx);
   if (!tree && !allowInitialize) return null;
   tree ??= createStoryTree(ctx.chat);
@@ -1607,11 +1974,14 @@ async function projectRoute(ctx, tree) {
   };
   try {
     for (const adapter of adapters) {
-      acceptMetadata(adapter, await adapter.beforeSwitch?.(hookInfo()));
+      const detail = { ...hookInfo(), getReplyMemory: index => readReplyMemory(messages[index], adapter.messageFields) };
+      adapterPreparingOwner = adapter.id;
+      try { acceptMetadata(adapter, await adapter.beforeSwitch?.(detail)); }
+      finally { adapterPreparingOwner = null; }
       assertChat();
       prepared.push(adapter);
       if (branchChange.fork) {
-        acceptMetadata(adapter, await adapter.onFork?.(hookInfo()));
+        acceptMetadata(adapter, await adapter.onFork?.(detail));
         assertChat();
       }
     }
@@ -1731,6 +2101,13 @@ async function projectRoute(ctx, tree) {
 }
 
 async function switchHistoricalReply(messageIndex, direction) {
+  if (storyMode(context()) === "native") {
+    const message = context().chat[messageIndex];
+    const count = message?.swipes?.length ?? 0;
+    if (!count) throw Error("没有可预览的回复。");
+    showNativeReply(messageIndex, ((message.swipe_id ?? 0) + direction + count) % count);
+    return;
+  }
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再切换历史回复。");
   const ctx = context();
   if (!isSoloChat(ctx)) throw new Error("只支持单人角色聊天。");
@@ -1786,6 +2163,7 @@ async function switchHistoricalReply(messageIndex, direction) {
 }
 
 async function forkFromMessage(messageIndex) {
+  if (storyMode(context()) === "native") return runNative(() => nativeStorage.createBranch(messageIndex));
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再切换剧情路线。");
   const ctx = context();
   if (!isSoloChat(ctx)) throw new Error("只支持单人角色聊天。");
@@ -1807,6 +2185,7 @@ async function forkFromMessage(messageIndex) {
 }
 
 async function forkFromSwipe(messageIndex, swipeIndex) {
+  if (storyMode(context()) === "native") return runNative(() => nativeStorage.createBranch(messageIndex, swipeIndex));
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再切换剧情路线。");
   const ctx = context();
   if (!isSoloChat(ctx) || !ctx.chat[messageIndex] || !ctx.chat[messageIndex - 1]) throw new Error("重说回复或分叉楼层不存在。");
@@ -1825,6 +2204,7 @@ async function forkFromSwipe(messageIndex, swipeIndex) {
 }
 
 async function activateBranch(branchId) {
+  if (storyMode(context()) === "native") return runNative(() => nativeStorage.switchRoute(branchId));
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再切换剧情路线。");
   state.busy = true;
   try {
@@ -1862,6 +2242,25 @@ function pruneDeletedBranchLayout(tree) {
 }
 
 async function deleteBranch(branchId) {
+  if (storyMode(context()) === "native") {
+    const tree = nativeStorage.view();
+    const selected = new Set([branchId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const route of Object.values(tree.branches)) if (selected.has(route.parentBranchId) && !selected.has(route.id)) { selected.add(route.id); changed = true; }
+    }
+    return runNative(async () => {
+      await nativeStorage.removeRoutes([...selected]);
+      const view = nativeStorage.view();
+      pruneDeletedBranchLayout(view);
+      const nodeKeys = new Set(getStoryBranchRows(view).map(route => route.nodeKey).filter(Boolean));
+      for (const key of ["nodeNotes", "nodeNames", "nodeSummaries"]) for (const id of Object.keys(view[key] ?? {})) {
+        if (!nodeKeys.has(id)) delete view[key][id];
+      }
+      storeGraph(context(), view);
+    });
+  }
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再删除剧情分支。");
   state.busy = true;
   try {
@@ -1894,6 +2293,11 @@ async function editBranchNote(branchId) {
   const autoSummary = branch.messageIds.length ? messageExcerpt(tree.messages[branch.messageIds[0]]) : "";
   const details = await editNote("查看和编辑分支摘要", { branchId, title: displayTitle, summary: branch.summary ?? autoSummary, note: branch.note }, "branch");
   if (details === null) return;
+  if (tree.storageMode === "native") {
+    await runNative(() => nativeStorage.updateRoute(branchId, { title: details.title.trim().slice(0, 80) || branch.title, autoTitle: false,
+      summary: details.summary.trim().slice(0, 1000), note: details.note.trim().slice(0, 1000) }));
+    return;
+  }
   const editedTitle = details.title.trim().slice(0, 80);
   if (editedTitle && editedTitle !== displayTitle) {
     branch.title = editedTitle;
@@ -1906,7 +2310,7 @@ async function editBranchNote(branchId) {
   branch.note = details.note.trim().slice(0, 1000);
   if (!branch.note) delete branch.note;
   storeGraph(ctx, tree);
-  await ctx.saveChat?.();
+  if (tree.storageMode !== "native") await ctx.saveChat?.();
   refreshUi({ chatButtons: false });
 }
 
@@ -1926,7 +2330,7 @@ async function editNodeNote(branchId) {
   tree.nodeSummaries ??= {};
   const details = await editNote(row.kind === "swipe" ? "查看和编辑回复组" : "查看和编辑分叉点", {
     nodeKind: row.kind,
-    pointName: tree.nodeNames[nodeKey] ?? tree.nodeNames[legacyKey] ?? `第 ${row.displayForkIndex + 1} 楼${row.kind === "swipe" ? "回复选择" : "分叉点"}`,
+    pointName: tree.nodeNames[nodeKey] ?? tree.nodeNames[legacyKey] ?? (row.legacyForkUnknown ? "分叉位置未知" : `第 ${row.displayForkIndex + 1} 楼${row.kind === "swipe" ? "回复选择" : "分叉点"}`),
     summary: tree.nodeSummaries[nodeKey] ?? tree.nodeSummaries[legacyKey] ?? autoSummary,
     note: tree.nodeNotes[nodeKey] ?? tree.nodeNotes[legacyKey] ?? "",
   }, "node");
@@ -1941,11 +2345,21 @@ async function editNodeNote(branchId) {
   if (value) tree.nodeNotes[nodeKey] = value;
   else delete tree.nodeNotes[nodeKey];
   storeGraph(ctx, tree);
-  await ctx.saveChat?.();
+  if (tree.storageMode !== "native") await ctx.saveChat?.();
   refreshUi({ chatButtons: false });
 }
 
 async function returnToForkNode(branchId) {
+  if (storyMode(context()) === "native") {
+    const branch = nativeStorage.view().branches[branchId];
+    if (!branch?.parentBranchId) throw Error("找不到父路线。");
+    return runNative(async () => {
+      await nativeStorage.switchRoute(branch.parentBranchId);
+      const index = context().chat.findIndex(message => getStoryMessageId(message) === branch.forkMessageId);
+      if (index < 0) throw Error("父路线中的分叉楼层已改变。");
+      await nativeStorage.createBranch(index);
+    });
+  }
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再切换剧情路线。");
   const current = context();
   if (!isSoloChat(current)) throw new Error("只支持单人角色聊天。");
@@ -1972,7 +2386,7 @@ async function saveCardPosition(branchId, position) {
   tree.layout ??= {};
   tree.layout[branchId] = { x: position.x, y: position.y, layoutVersion: 4 };
   storeGraph(ctx, tree);
-  await ctx.saveChat?.();
+  if (tree.storageMode !== "native") await ctx.saveChat?.();
 }
 
 async function saveForkPosition(forkId, position, narrow) {
@@ -1982,7 +2396,7 @@ async function saveForkPosition(forkId, position, narrow) {
   tree.layout ??= {};
   tree.layout[forkId] = { x: position.x, y: position.y, kind: "fork", narrow, layoutVersion: 4 };
   storeGraph(ctx, tree);
-  await ctx.saveChat?.();
+  if (tree.storageMode !== "native") await ctx.saveChat?.();
 }
 
 async function saveCompactPosition(kind, id, position, narrow) {
@@ -1993,7 +2407,7 @@ async function saveCompactPosition(kind, id, position, narrow) {
   tree.compactLayout[kind] ??= {};
   tree.compactLayout[kind][id] = { x: position.x, y: position.y, narrow, orientation: "vertical-spine-v3" };
   storeGraph(ctx, tree);
-  await ctx.saveChat?.();
+  if (tree.storageMode !== "native") await ctx.saveChat?.();
 }
 
 async function saveEndingPosition(branchId, position, narrow) {
@@ -2003,7 +2417,7 @@ async function saveEndingPosition(branchId, position, narrow) {
   tree.layout ??= {};
   tree.layout[`end:${branchId}`] = { x: position.x, y: position.y, kind: "end", narrow, layoutVersion: 4 };
   storeGraph(ctx, tree);
-  await ctx.saveChat?.();
+  if (tree.storageMode !== "native") await ctx.saveChat?.();
 }
 
 function restoreProtectedProjection(error) {
@@ -2060,6 +2474,7 @@ function repairCompletedSwipeIndices(messages) {
 async function handleChatLoaded() {
   if (!state.routeSwitching) invalidateMemoryTasks();
   if (state.busy || swipeState !== "none" || isGenerating()) return;
+  await connectMemoryEnhancement();
   const ctx = context();
   if (isSoloChat(ctx) && graphFrom(ctx)) {
     try {
@@ -2086,6 +2501,7 @@ function installEvents(ctx) {
   const eventSource = ctx.eventSource;
   const types = ctx.eventTypes ?? ctx.event_types ?? {};
   if (!eventSource) return;
+  bindEvent(eventSource, types.APP_READY, connectMemoryEnhancement);
   for (const key of ["MESSAGE_SENT", "MESSAGE_RECEIVED", "MESSAGE_SWIPED", "MESSAGE_EDITED", "MESSAGE_UPDATED", "MESSAGE_SWIPE_DELETED"]) {
     bindEvent(eventSource, types[key], (...args) => {
       if (["MESSAGE_SWIPED", "MESSAGE_EDITED", "MESSAGE_SWIPE_DELETED"].includes(key)) invalidateMemoryTasks();
@@ -2139,6 +2555,67 @@ function installUi(menu, markup) {
       return;
     }
     try {
+      if (button.dataset.action === "back-to-tree") openTree();
+      if (button.dataset.action === "mode-single") await chooseStoryMode("single");
+      if (button.dataset.action === "mode-native") await chooseStoryMode("native");
+      if (button.dataset.action === "story-library") await openStoryLibrary();
+      if (button.dataset.action === "library-rebuild") await openStoryLibrary(true);
+      if (button.dataset.action === "legacy-find") await findLegacyStory();
+      if (button.dataset.action === "legacy-cancel") {
+        if (legacySearch) legacySearch.abort();
+        else await openStoryLibrary();
+      }
+      if (button.dataset.action === "legacy-accept") {
+        if (!legacyPlan || state.busy || isGenerating()) throw Error("请先完成查找。");
+        const names = [...treePanel.querySelectorAll('[data-role="legacy-choice"]:checked')].map(input => input.value);
+        if (names.length < 2) throw Error("至少选择两条可用记录。");
+        openConfirmation({ kind: "adopt-legacy", plan: legacyPlan, names }, "整理已有原生分支",
+          `将所选 ${names.length} 条记录整理为一个故事吗？各文件、正文和记忆分别保留。整理期间请勿在其他设备编辑这些聊天。`, "确认整理");
+      }
+      if (button.dataset.action === "library-original") {
+        originalListOnce = true;
+        closeTree();
+        document.getElementById("option_select_chat")?.click();
+      }
+      if (button.dataset.action === "library-open") {
+        const entry = libraryEntries[Number(button.dataset.entry)];
+        if (!entry) throw Error("列表已改变，请重新打开。");
+        const current = entry.routes.find(route => route.chatName === context().chatId);
+        const route = current ?? [...entry.routes].sort((a, b) => b.updated - a.updated)[0];
+        await openLibraryChat(route.chatName);
+      }
+      if (button.dataset.action === "library-chat") await openLibraryChat(button.dataset.chatName);
+      if (button.dataset.action === "library-routes") {
+        const list = button.closest("article").querySelector('[data-role="library-routes"]');
+        list.hidden = !list.hidden;
+      }
+      if (button.dataset.action === "library-export") {
+        const entry = libraryEntries[Number(button.dataset.entry)];
+        if (entry?.storyId) await exportNativeStory(true, entry.storyId);
+      }
+      if (button.dataset.action === "library-delete") {
+        const entry = libraryEntries[Number(button.dataset.entry)];
+        if (entry?.storyId) openConfirmation({ kind: "delete-story", storyId: entry.storyId, files: entry.routes.map(route => route.chatName) }, "删除整个故事",
+          `删除「${entry.title}」的全部 ${entry.routes.length} 条路线及聊天文件吗？此操作无法撤销。`, "删除整个故事");
+      }
+      if (button.dataset.action === "export-route") await exportNativeStory(false);
+      if (button.dataset.action === "import-story") treePanel.querySelector('[data-role="story-import"]').click();
+      if (button.dataset.action === "reply-next" || button.dataset.action === "reply-previous") {
+        const preview = checkedNativePreview();
+        const count = preview.message.swipes.length;
+        showNativeReply(preview.index, (preview.swipeId + (button.dataset.action === "reply-next" ? 1 : -1) + count) % count);
+      }
+      if (button.dataset.action === "reply-create") {
+        const preview = checkedNativePreview();
+        openConfirmation({ kind: "native-reply" }, "从预览回复继续", `从第 ${preview.index + 1} 楼回复 ${preview.swipeId + 1} 创建新的原生路线吗？原路线后续保留。`, "创建并继续");
+      }
+      if (button.dataset.action === "reply-existing") {
+        const preview = checkedNativePreview();
+        if (!nativeStorage.replyRoutes(preview.index, preview.swipeId).some(entry => entry.route.id === button.dataset.branchId)) throw Error("对应路线已改变，请重新预览。");
+        await activateBranch(button.dataset.branchId);
+        closeFloorDetail();
+        closeTree();
+      }
       if (button.dataset.action === "close-tree") closeTree();
       if (button.dataset.action === "zoom-in") zoomAt(view.scale * 1.2);
       if (button.dataset.action === "zoom-out") zoomAt(view.scale / 1.2);
@@ -2168,8 +2645,8 @@ function installUi(menu, markup) {
         const branchId = treePanel.querySelector('[data-role="note-editor"]')?.dataset.branchId;
         if (branchId) openDeleteBranchConfirm(branchId);
       }
-      if (button.dataset.action === "show-end") showEndDetail(button.dataset.branchId);
-      if (button.dataset.action === "close-floor-detail") treePanel.querySelector('[data-role="floor-detail"]').hidden = true;
+      if (button.dataset.action === "show-end") await showEndDetail(button.dataset.branchId);
+      if (button.dataset.action === "close-floor-detail") closeFloorDetail();
       if (button.dataset.action === "confirm-branch-switch") openBranchSwitchConfirm(button.dataset.branchId);
       if (button.dataset.action === "confirm-cancel") closeConfirmation();
       if (button.dataset.action === "confirm-accept") await confirmPendingAction();
@@ -2184,12 +2661,25 @@ function installUi(menu, markup) {
     if (event.target === event.currentTarget) pendingNoteEditor?.finish(null);
   });
   treePanel.querySelector('[data-role="floor-detail"]')?.addEventListener("click", (event) => {
-    if (event.target === event.currentTarget) event.currentTarget.hidden = true;
+    if (event.target === event.currentTarget) closeFloorDetail();
   });
   confirmDialog?.addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeConfirmation();
   });
   treePanel.addEventListener("click", panelClickHandler);
+  treePanel.querySelector('[data-role="story-import"]')?.addEventListener("change", async event => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const owner = context().chatId;
+      const characterId = context().characterId;
+      const bundle = JSON.parse(await file.text());
+      if (context().chatId !== owner || context().characterId !== characterId) throw Error("聊天已改变，请重新选择导入文件。");
+      await runNative(() => nativeStorage.importStory(bundle, () => { state.routeSwitching = false; }));
+      openTree();
+    } catch (error) { toast("error", error.message); }
+  });
   confirmDialog?.addEventListener("click", panelClickHandler);
   treePanel.addEventListener("keydown", (event) => {
     if ((event.key === "Enter" || event.key === " ") && event.target.matches('.story-branch-tree__compact-tail, .story-branch-tree__compact-label-button')) {
@@ -2493,8 +2983,7 @@ function installUi(menu, markup) {
               updateLayoutBounds(renderedLayout);
             }
           } else if (!pointer.moved && event.type === "pointerup") {
-            try { showEndDetail(pointer.branchId); }
-            catch (error) { toast("warning", error.message); }
+            showEndDetail(pointer.branchId).catch(error => toast("warning", error.message));
           }
           suppressEndClickBranchId = pointer.branchId;
           window.setTimeout(() => { if (suppressEndClickBranchId === pointer.branchId) suppressEndClickBranchId = null; }, 0);
@@ -2560,15 +3049,33 @@ function installUi(menu, markup) {
     if (confirmDialog && !confirmDialog.hidden) closeConfirmation();
     else if (treePanel.hidden) return;
     else if (pendingNoteEditor) pendingNoteEditor.finish(null);
-    else if (!treePanel.querySelector('[data-role="floor-detail"]').hidden) treePanel.querySelector('[data-role="floor-detail"]').hidden = true;
+    else if (!treePanel.querySelector('[data-role="floor-detail"]').hidden) closeFloorDetail();
     else closeTree();
   };
   document.addEventListener("keydown", canvasKeyHandler);
   chatClickHandler = (event) => {
+    if (event.target.closest("#option_select_chat")) {
+      if (originalListOnce) { originalListOnce = false; return; }
+      const ctx = context();
+      const avatar = ctx?.characters?.[ctx.characterId]?.avatar;
+      const entries = ctx?.extensionSettings?.storyBranchTreeCatalog?.characters?.[avatar]?.routes;
+      if (isSoloChat(ctx) && entries && Object.keys(entries).length) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        openStoryLibrary().catch(error => toast("warning", error.message));
+        return;
+      }
+    }
     const arrow = event.target.closest(".swipe_left, .swipe_right");
     const historicalRow = arrow?.closest(".mes.story-branch-tree__history-swipes");
     if (historicalRow) {
       const messageIndex = Number(historicalRow.getAttribute("mesid"));
+      if (storyMode(context()) === "native") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        switchHistoricalReply(messageIndex, arrow.classList.contains("swipe_right") ? 1 : -1).catch(error => toast("warning", error.message));
+        return;
+      }
       const tree = graphFrom(context());
       const reply = tree && historicalReplySource(tree, messageIndex);
       if (historicalRow.classList.contains("last_mes") && arrow.classList.contains("swipe_right")
@@ -2631,6 +3138,7 @@ function handlePendingSend(event) {
 }
 
 export async function activate() {
+  extensionEnabled = true;
   const ctx = context();
   if (!ctx) return;
   const menu = document.getElementById("extensionsMenu");
@@ -2649,6 +3157,8 @@ export async function activate() {
 }
 
 export function disable() {
+  extensionEnabled = false;
+  nativeStorage.epoch++;
   for (const [source, eventName, handler] of eventHandlers.splice(0)) {
     source.removeListener(eventName, handler);
   }
@@ -2679,6 +3189,16 @@ export function disable() {
   pinchGesture = null;
   suppressEndClickBranchId = null;
   renderedLayout = null;
+  pendingModeAction = null;
+  nativePreview = null;
+  libraryEntries = [];
+  legacySearch?.abort();
+  legacySearch = null;
+  legacyPlan = null;
+  originalListOnce = false;
+  nativePrepared = [];
+  nativeChangeOwner = null;
+  nativeStorage.cachedView = null;
   removePublicApi();
   pendingNoteEditor?.finish(null);
   pendingNoteEditor = null;
@@ -2691,4 +3211,8 @@ export function disable() {
   document.body.classList.remove("story-branch-tree-open");
   document.body.classList.remove("story-branch-tree-confirm-open");
   document.querySelectorAll(".story-branch-tree__fork-button").forEach((button) => button.remove());
+  document.querySelectorAll(".mes.story-branch-tree__history-swipes").forEach(row => {
+    row.classList.remove("story-branch-tree__history-swipes");
+    row.querySelector(".swipes-counter")?.removeAttribute("data-story-swipe-count");
+  });
 }

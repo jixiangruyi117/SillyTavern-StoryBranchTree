@@ -10,6 +10,8 @@
       <p data-role="status" aria-live="polite"></p>
     </div>
     <div class="story-branch-tree__toolbar" aria-label="画布控制">
+      <button type="button" data-action="back-to-tree">返回树图</button>
+      <button type="button" data-action="story-library" title="按故事整理聊天记录">故事</button>
       <div class="story-branch-tree__zoom" role="group" aria-label="缩放画布">
         <button type="button" data-action="zoom-out" title="缩小" aria-label="缩小">−</button>
         <span data-role="zoom-level">100%</span>
@@ -22,6 +24,15 @@
     </div>
     <button class="story-branch-tree__close" type="button" data-action="close-tree" title="关闭" aria-label="关闭剧情分支树"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
   </header>
+  <section class="story-branch-tree__mode-picker" data-role="mode-picker" hidden>
+    <h3>选择这个故事的保存方式</h3>
+    <p>选定后，这个故事的所有路线使用同一种方式。已有故事不会自动转换。</p>
+    <button type="button" data-action="mode-single"><strong>单聊天模式</strong><span>所有路线放在当前聊天中，整条聊天一起导出；保存时会携带所有路线。</span></button>
+    <button type="button" data-action="mode-native"><strong>原生分支模式</strong><span>各路线使用独立聊天，列表按故事归组；每次保存当前路线，更贴近原生插件的聊天切换。</span></button>
+    <button type="button" data-action="legacy-find"><strong>查找整个故事</strong><span>以前用酒馆开过分支？从当前主线或子分支查找相关记录，预览后整理到一起。</span></button>
+  </section>
+  <section class="story-branch-tree__library" data-role="story-library" aria-label="故事与聊天记录" hidden></section>
+  <input type="file" data-role="story-import" accept=".json,application/json" hidden>
   <div class="story-branch-tree__canvas" data-role="canvas" aria-label="剧情路线关系图">
     <div class="story-branch-tree__world" data-role="world"></div>
     <div class="story-branch-tree__empty" data-role="empty" hidden></div>
@@ -61,6 +72,7 @@
         <button type="button" data-action="close-floor-detail" aria-label="关闭楼层内容">×</button>
       </div>
       <div class="story-branch-tree__floor-detail-content" data-role="floor-content"></div>
+      <div class="story-branch-tree__reply-actions" data-role="reply-actions"></div>
     </div>
   </div>
 </section>
