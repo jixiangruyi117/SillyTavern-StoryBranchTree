@@ -2623,6 +2623,7 @@ function installEvents(ctx) {
 function installUi(menu, markup) {
   const template = document.createElement("div");
   template.innerHTML = markup;
+  const launcherContainer = template.querySelector("#story-branch-tree-wand-container");
   const launcher = template.querySelector("#story-branch-tree-launcher");
   const panel = document.getElementById("story-branch-tree");
   const newPanel = template.querySelector("#story-branch-tree");
@@ -2630,7 +2631,7 @@ function installUi(menu, markup) {
   if (!panel && newPanel) document.body.append(newPanel);
   if (confirmDialog) document.body.append(confirmDialog);
   const treePanel = panel ?? newPanel;
-  if (launcher) menu.append(launcher);
+  if (launcherContainer) menu.append(launcherContainer);
   if (!treePanel || !launcher) return;
   updateAppearance();
   panelClickHandler = async (event) => {
@@ -3328,7 +3329,7 @@ export function disable() {
   state.routeSwitching = false;
   panel?.remove();
   confirmDialog?.remove();
-  document.getElementById("story-branch-tree-launcher")?.remove();
+  document.getElementById("story-branch-tree-wand-container")?.remove();
   document.body.classList.remove("story-branch-tree-open");
   document.body.classList.remove("story-branch-tree-confirm-open");
   document.querySelectorAll(".story-branch-tree__fork-button").forEach((button) => button.remove());
