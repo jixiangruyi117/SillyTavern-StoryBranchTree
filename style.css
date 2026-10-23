@@ -1,3 +1,27 @@
+:host *,
+:host *::before,
+:host *::after {
+  box-sizing: border-box;
+}
+
+:host :is(button, input, textarea, select) {
+  font: inherit;
+  color: inherit;
+}
+
+:host :is(input:not([type="checkbox"]):not([type="radio"]), textarea, select) {
+  min-width: 0;
+  padding: 0.4em 0.55em;
+  border: 1px solid var(--SmartThemeBorderColor, color-mix(in srgb, currentColor 30%, transparent));
+  border-radius: 0.4em;
+  background: var(--SmartThemeBlurTintColor, #171717);
+}
+
+:host :is(button, input, textarea, select, [data-role="confirm-message"]):focus-visible {
+  outline: 2px solid var(--SmartThemeQuoteColor, #b9915a);
+  outline-offset: 2px;
+}
+
 body.story-branch-tree-open,
 body.story-branch-tree-confirm-open {
   overflow: hidden;
@@ -12,6 +36,7 @@ body.story-branch-tree-confirm-open {
 }
 
 #story-branch-tree.story-branch-tree {
+  pointer-events: auto;
   position: fixed;
   inset: 0;
   z-index: 10000;
@@ -136,6 +161,13 @@ body.story-branch-tree-confirm-open {
   white-space: nowrap;
 }
 
+.story-branch-tree__heading p[title] {
+  max-height: 4.5em;
+  overflow: auto;
+  opacity: 1;
+  white-space: normal;
+}
+
 .story-branch-tree__toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -175,7 +207,8 @@ body.story-branch-tree-confirm-open {
   white-space: nowrap;
 }
 
-.story-branch-tree__toolbar svg {
+.story-branch-tree__toolbar svg,
+.story-branch-tree__close svg {
   width: 18px;
   height: 18px;
   flex: 0 0 auto;
@@ -867,6 +900,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
 }
 
 .story-branch-tree__action-confirm {
+  pointer-events: auto;
   position: fixed;
   z-index: 10001;
   inset: 0;
@@ -886,10 +920,18 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
 
 .story-branch-tree__confirm-card {
   width: min(24em, 100%);
+  overflow: hidden;
   backdrop-filter: blur(14px);
 }
 
+.story-branch-tree__confirm-card > h3,
+.story-branch-tree__confirm-card > .story-branch-tree__note-editor-actions {
+  flex-shrink: 0;
+}
+
 .story-branch-tree__confirm-card p {
+  min-height: 0;
+  overflow-y: auto;
   margin: 0;
   line-height: 1.5;
   overflow-wrap: anywhere;

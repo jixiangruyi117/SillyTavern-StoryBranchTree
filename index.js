@@ -28,6 +28,7 @@ import { createMuyooMemoryCompatibility, muyooSheetsAtMessages } from "./modules
 import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.77";
 import { installRecentStories } from "./modules/RecentStories.js?v=0.1.81";
 import { createHostCompatibility } from "./modules/HostCompatibility.js?v=0.1.77";
+import { createUiSurface } from "./modules/UiSurface.js?v=0.1.82";
 import * as tavernCore from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
 
@@ -86,6 +87,8 @@ let originalListOnce = false;
 let nativePrepared = [];
 let nativeChangeOwner = null;
 let extensionEnabled = true;
+let uiSurface = null;
+let uiActivation = null;
 let disposeRecentStories = null;
 const singleMemoryCompatibility = createMuyooMemoryCompatibility({ getContext: context, getApi: () => publicApi,
   getPlugin: () => storyMode(context()) === "single" && !context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")
@@ -104,6 +107,10 @@ const view = { x: 48, y: 48, scale: 1, needsFit: true, dragging: false, pointerI
 
 function context() {
   return globalThis.SillyTavern?.getContext?.();
+}
+
+function uiDocument() {
+  return uiSurface?.root ?? document;
 }
 
 async function connectMemoryEnhancement() {
@@ -146,6 +153,14 @@ async function ensureSingleMemory({ captureReplies = false } = {}) {
 }
 
 function toast(level, message) {
+  // Page toasts sit below a showing popover. Reuse our visible status region
+  // so errors inside the tree still have an immediately visible explanation.
+  const panel = uiSurface?.root.getElementById("story-branch-tree");
+  if (panel && !panel.hidden) {
+    const status = panel.querySelector('[data-role="status"]');
+    status.textContent = message;
+    status.title = message;
+  }
   globalThis.toastr?.[level]?.(message, "剧情分支树");
 }
 
@@ -1102,12 +1117,13 @@ function renderCompactTree(root, tree, branches, groups, groupsByParent, branchE
 }
 
 function renderTree() {
-  const root = document.getElementById("story-branch-tree");
+  const root = uiDocument().getElementById("story-branch-tree");
   if (!root) return;
   const ctx = context();
   const focusButton = root.querySelector('[data-action="focus-current"]');
   if (focusButton) focusButton.disabled = !isSoloChat(ctx) || !graphFrom(ctx);
   const status = root.querySelector('[data-role="status"]');
+  status.removeAttribute("title");
   const world = root.querySelector('[data-role="world"]');
   const empty = root.querySelector('[data-role="empty"]');
   if (!isSoloChat(ctx)) {
@@ -1296,13 +1312,13 @@ function renderTree() {
 }
 
 function applyView() {
-  const world = document.querySelector('#story-branch-tree [data-role="world"]');
+  const world = uiDocument().querySelector('#story-branch-tree [data-role="world"]');
   if (world) world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
 }
 
 function fitView() {
-  const canvas = document.querySelector('#story-branch-tree [data-role="canvas"]');
-  const world = document.querySelector('#story-branch-tree [data-role="world"]');
+  const canvas = uiDocument().querySelector('#story-branch-tree [data-role="canvas"]');
+  const world = uiDocument().querySelector('#story-branch-tree [data-role="world"]');
   if (!canvas || !world) return;
   const layout = renderedLayout;
   const minX = layout?.minX ?? 0;
@@ -1331,7 +1347,7 @@ function focusCurrentBranch() {
   const tree = graphFrom(ctx);
   if (!tree) throw new Error("当前聊天还没有剧情树。");
   validateStoryTree(tree);
-  const canvas = document.querySelector('#story-branch-tree [data-role="canvas"]');
+  const canvas = uiDocument().querySelector('#story-branch-tree [data-role="canvas"]');
   const layout = renderedLayout;
   if (!canvas || !layout) throw new Error("当前视图没有可定位的路线。");
   const branchId = tree.activeBranchId;
@@ -1369,7 +1385,7 @@ function clampViewScale(nextScale) {
 }
 
 function zoomAt(nextScale, clientX, clientY) {
-  const canvas = document.querySelector('#story-branch-tree [data-role="canvas"]');
+  const canvas = uiDocument().querySelector('#story-branch-tree [data-role="canvas"]');
   if (!canvas) return;
   const bounds = canvas.getBoundingClientRect();
   const px = clientX === undefined ? canvas.clientWidth / 2 : clientX - bounds.left;
@@ -1448,7 +1464,7 @@ async function chooseStoryMode(mode) {
   if (current.chat !== owner.chat || current.chatId !== owner.chatId || current.characterId !== owner.characterId) throw Error("聊天已改变，旧故事模式已保存，请重新打开当前故事。");
   pendingModeAction = null;
   await connectMemoryEnhancement();
-  document.querySelector('#story-branch-tree [data-role="mode-picker"]').hidden = true;
+  uiDocument().querySelector('#story-branch-tree [data-role="mode-picker"]').hidden = true;
   refreshUi();
   request?.action?.();
 }
@@ -1461,7 +1477,7 @@ async function openStoryLibrary(rebuild = false) {
   legacyPlan = null;
   libraryEntries = await nativeStorage.listStories({ rebuild });
   openTree();
-  const root = document.getElementById("story-branch-tree");
+  const root = uiDocument().getElementById("story-branch-tree");
   root.classList.add("is-library");
   root.querySelector('[data-role="status"]').textContent = `故事与聊天 · ${libraryEntries.length} 项`;
   root.querySelector('[data-role="mode-picker"]').hidden = true;
@@ -1489,14 +1505,14 @@ async function openLibraryStoryTree(entry) {
 async function findLegacyStory() {
   await openStoryLibrary();
   const controller = legacySearch = new AbortController();
-  const library = document.querySelector('#story-branch-tree [data-role="story-library"]');
+  const library = uiDocument().querySelector('#story-branch-tree [data-role="story-library"]');
   library.innerHTML = '<h3>查找整个故事</h3><p data-role="legacy-progress" aria-live="polite">正在查找…</p><button data-action="legacy-cancel">取消查找</button>';
   const progress = text => { const el = library.querySelector('[data-role="legacy-progress"]'); if (el) el.textContent = text; };
   try {
     const plan = await runNative(() => nativeStorage.discoverLegacyStory({ signal: controller.signal, onProgress: progress }));
     if (controller.signal.aborted) return;
     legacyPlan = plan;
-    document.querySelector('#story-branch-tree [data-role="status"]').textContent = "旧原生分支 · 整理预览";
+    uiDocument().querySelector('#story-branch-tree [data-role="status"]').textContent = "旧原生分支 · 整理预览";
     const usable = plan.rows.filter(row => !row.blocked).length;
     const alreadyGrouped = !plan.rows.some(row => !row.blocked && !row.existing);
     library.innerHTML = `<h3>找到 ${usable} 条可整理记录</h3><p>故事：${escapeHtml(plan.title)}</p>`
@@ -1557,7 +1573,7 @@ function showNativeReply(index, swipeId) {
   if (!canForkCurrentSwipe(message) || typeof message.swipes[swipeId] !== "string") throw Error("重说回复不存在。");
   nativePreview = { chat: ctx.chat, chatId: ctx.chatId, message, index, swipeId,
     variantId: replyVersionId(message, swipeId), text: swipeId === (message.swipe_id ?? 0) ? message.mes : message.swipes[swipeId] };
-  const detail = document.querySelector('#story-branch-tree [data-role="floor-detail"]');
+  const detail = uiDocument().querySelector('#story-branch-tree [data-role="floor-detail"]');
   openTree();
   detail.querySelector('[data-role="floor-title"]').textContent = `第 ${index + 1} 楼 · 回复 ${swipeId + 1}/${message.swipes.length}（预览）`;
   detail.querySelector('[data-role="floor-content"]').textContent = nativePreview.text;
@@ -1577,7 +1593,7 @@ function checkedNativePreview() {
 }
 
 function closeFloorDetail() {
-  const detail = document.querySelector('#story-branch-tree [data-role="floor-detail"]');
+  const detail = uiDocument().querySelector('#story-branch-tree [data-role="floor-detail"]');
   if (detail) {
     detail.hidden = true;
     detail.querySelector('[data-role="floor-content"]').textContent = "";
@@ -1587,7 +1603,7 @@ function closeFloorDetail() {
 }
 
 function openTree() {
-  const panel = document.getElementById("story-branch-tree");
+  const panel = uiDocument().getElementById("story-branch-tree");
   if (!panel) return;
   panel.classList.remove("is-library");
   const toggle = panel.querySelector('[data-action="toggle-view"]');
@@ -1598,6 +1614,7 @@ function openTree() {
   const picker = panel.querySelector('[data-role="mode-picker"]');
   if (picker) picker.hidden = Boolean(storyMode(context()));
   document.body.classList.add("story-branch-tree-open");
+  uiSurface?.sync();
   view.needsFit = true;
   renderTree();
 }
@@ -1615,9 +1632,9 @@ function updateViewToggle(button) {
 function updateAppearance() {
   const solid = context()?.extensionSettings?.storyBranchTreeAppearance === "solid";
   for (const id of ["story-branch-tree", "story-branch-tree-confirm"]) {
-    document.getElementById(id)?.classList.toggle("is-solid", solid);
+    uiDocument().getElementById(id)?.classList.toggle("is-solid", solid);
   }
-  const button = document.querySelector('#story-branch-tree [data-action="toggle-appearance"]');
+  const button = uiDocument().querySelector('#story-branch-tree [data-action="toggle-appearance"]');
   if (button) {
     button.setAttribute("aria-pressed", String(solid));
     button.title = `外观：${solid ? "实心背景" : "跟随酒馆"}；点击切换为${solid ? "跟随酒馆" : "实心背景"}`;
@@ -1627,36 +1644,44 @@ function updateAppearance() {
 function closeTree() {
   legacySearch?.abort();
   legacyPlan = null;
-  const panel = document.getElementById("story-branch-tree");
+  const panel = uiDocument().getElementById("story-branch-tree");
   if (!panel) return;
   closeConfirmation();
   closeFloorDetail();
   panel.hidden = true;
   document.body.classList.remove("story-branch-tree-open");
+  uiSurface?.sync();
 }
 
 function closeConfirmation() {
   const help = pendingConfirmation?.kind === "help";
-  const dialog = document.getElementById("story-branch-tree-confirm");
+  const dialog = uiDocument().getElementById("story-branch-tree-confirm");
   if (dialog) dialog.hidden = true;
   pendingConfirmation = null;
   document.body.classList.remove("story-branch-tree-confirm-open");
-  if (help) document.querySelector('#story-branch-tree [data-action="story-help"]')?.focus();
+  uiSurface?.sync();
+  if (help) uiDocument().querySelector('#story-branch-tree [data-action="story-help"]')?.focus();
 }
 
 function openConfirmation(request, title, message, acceptLabel) {
-  const dialog = document.getElementById("story-branch-tree-confirm");
+  const dialog = uiDocument().getElementById("story-branch-tree-confirm");
   if (!dialog) throw new Error("确认弹窗未加载。");
   const ctx = context();
   pendingConfirmation = { ...request, chatId: ctx.chatId, characterId: ctx.characterId, groupId: ctx.groupId };
   dialog.classList.toggle("is-help", request.kind === "help");
   dialog.querySelector('[data-action="confirm-cancel"]').hidden = request.kind === "help";
   dialog.querySelector('[data-role="confirm-title"]').textContent = title;
-  dialog.querySelector('[data-role="confirm-message"]').textContent = message;
+  const messageElement = dialog.querySelector('[data-role="confirm-message"]');
+  messageElement.textContent = message;
+  if (request.kind === "help") messageElement.tabIndex = 0;
+  else messageElement.removeAttribute("tabindex");
   dialog.querySelector('[data-action="confirm-accept"]').textContent = acceptLabel;
   dialog.hidden = false;
   document.body.classList.add("story-branch-tree-confirm-open");
-  dialog.querySelector('[data-action="confirm-accept"]').focus();
+  uiSurface?.sync();
+  messageElement.scrollTop = 0;
+  const focusTarget = request.kind === "help" ? messageElement : dialog.querySelector('[data-action="confirm-accept"]');
+  focusTarget.focus({ preventScroll: true });
 }
 
 function openBranchSwitchConfirm(branchId) {
@@ -1767,7 +1792,7 @@ async function confirmPendingAction() {
     closeFloorDetail();
   } else if (request.kind === "adopt-legacy") {
     const result = await runNative(() => nativeStorage.adoptLegacyStory(request.plan, request.names, { onProgress: text => {
-      const el = document.querySelector('#story-branch-tree [data-role="legacy-progress"]'); if (el) el.textContent = text;
+      const el = uiDocument().querySelector('#story-branch-tree [data-role="legacy-progress"]'); if (el) el.textContent = text;
     } }));
     pendingModeAction = null;
     await openStoryLibrary();
@@ -1816,7 +1841,7 @@ async function confirmPendingAction() {
 async function showEndDetail(branchId) {
   const tree = graphFrom(context());
   const branch = tree?.branches?.[branchId];
-  const panel = document.getElementById("story-branch-tree");
+  const panel = uiDocument().getElementById("story-branch-tree");
   const detail = panel?.querySelector('[data-role="floor-detail"]');
   if (!branch || !detail) throw new Error("找不到这条路线的终点。");
   const owner = context().chat;
@@ -1842,7 +1867,7 @@ function escapeAttribute(value) {
 }
 
 function editNote(title, values = {}, mode = "note") {
-  const panel = document.getElementById("story-branch-tree");
+  const panel = uiDocument().getElementById("story-branch-tree");
   const editor = panel?.querySelector('[data-role="note-editor"]');
   const titleElement = editor?.querySelector('[data-role="note-title"]');
   const branchNameField = editor?.querySelector('[data-role="branch-name-field"]');
@@ -1986,7 +2011,7 @@ function renderForkButtons() {
 
 function refreshUi({ chatButtons = true } = {}) {
   if (!extensionEnabled) return;
-  if (!document.getElementById("story-branch-tree")?.hidden) renderTree();
+  if (!uiDocument().getElementById("story-branch-tree")?.hidden) renderTree();
   if (chatButtons) renderForkButtons();
 }
 
@@ -2653,11 +2678,11 @@ function installUi(menu, markup) {
   template.innerHTML = markup;
   const launcherContainer = template.querySelector("#story-branch-tree-wand-container");
   const launcher = template.querySelector("#story-branch-tree-launcher");
-  const panel = document.getElementById("story-branch-tree");
+  const panel = uiDocument().getElementById("story-branch-tree");
   const newPanel = template.querySelector("#story-branch-tree");
   const confirmDialog = template.querySelector("#story-branch-tree-confirm");
-  if (!panel && newPanel) document.body.append(newPanel);
-  if (confirmDialog) document.body.append(confirmDialog);
+  if (!panel && newPanel) uiSurface.root.append(newPanel);
+  if (confirmDialog) uiSurface.root.append(confirmDialog);
   const treePanel = panel ?? newPanel;
   if (launcherContainer) menu.append(launcherContainer);
   if (!treePanel || !launcher) return;
@@ -3186,7 +3211,11 @@ function installUi(menu, markup) {
   canvasKeyHandler = (event) => {
     if (event.key === "Tab" && pendingConfirmation?.kind === "help" && !confirmDialog.hidden) {
       event.preventDefault();
-      confirmDialog.querySelector('[data-action="confirm-accept"]').focus();
+      const message = confirmDialog.querySelector('[data-role="confirm-message"]');
+      const accept = confirmDialog.querySelector('[data-action="confirm-accept"]');
+      const focused = uiDocument().activeElement;
+      const next = focused === message ? accept : focused === accept ? message : event.shiftKey ? accept : message;
+      next.focus({ preventScroll: true });
       return;
     }
     if (event.key !== "Escape") return;
@@ -3286,14 +3315,29 @@ export async function activate() {
   const ctx = context();
   if (!ctx) return;
   const menu = document.getElementById("extensionsMenu");
-  if (!menu || document.getElementById("story-branch-tree")) return;
+  if (!menu || uiSurface || uiActivation) return;
+  const attempt = uiActivation = {};
+  let surface = null;
   try {
     const markup = await ctx.renderExtensionTemplateAsync(EXTENSION_FOLDER, "settings", {});
+    if (uiActivation !== attempt || !extensionEnabled) return;
+    surface = createUiSurface(new URL("./style.css?v=0.1.82", import.meta.url).href);
+    uiSurface = surface;
+    await surface.ready;
+    if (uiActivation !== attempt || !extensionEnabled) return;
     installUi(menu, markup);
   } catch (error) {
-    console.error("[StoryBranchTree] Could not load settings panel", error);
+    surface?.dispose();
+    if (uiSurface === surface) uiSurface = null;
+    if (uiActivation === attempt) {
+      document.getElementById("story-branch-tree-wand-container")?.remove();
+      console.error("[StoryBranchTree] Could not load settings panel", error);
+    }
     return;
+  } finally {
+    if (uiActivation === attempt) uiActivation = null;
   }
+  if (uiSurface !== surface || !extensionEnabled) return;
   installEvents(ctx);
   installPublicApi();
   disposeRecentStories?.();
@@ -3304,6 +3348,7 @@ export async function activate() {
 
 export function disable() {
   extensionEnabled = false;
+  uiActivation = null;
   canvasResizeObserver?.disconnect();
   canvasResizeObserver = null;
   if (canvasResizeFrame !== null) cancelAnimationFrame(canvasResizeFrame);
@@ -3314,8 +3359,8 @@ export function disable() {
   for (const [source, eventName, handler] of eventHandlers.splice(0)) {
     source.removeListener(eventName, handler);
   }
-  const panel = document.getElementById("story-branch-tree");
-  const confirmDialog = document.getElementById("story-branch-tree-confirm");
+  const panel = uiDocument().getElementById("story-branch-tree");
+  const confirmDialog = uiDocument().getElementById("story-branch-tree-confirm");
   if (panel && panelClickHandler) panel.removeEventListener("click", panelClickHandler);
   if (confirmDialog && panelClickHandler) confirmDialog.removeEventListener("click", panelClickHandler);
   if (panel && canvasPointerHandler) {
@@ -3357,8 +3402,11 @@ export function disable() {
   pendingConfirmation = null;
   state.busy = false;
   state.routeSwitching = false;
+  // Restore focus while the focused dialog is still connected to the host.
+  uiSurface?.dispose();
   panel?.remove();
   confirmDialog?.remove();
+  uiSurface = null;
   document.getElementById("story-branch-tree-wand-container")?.remove();
   document.body.classList.remove("story-branch-tree-open");
   document.body.classList.remove("story-branch-tree-confirm-open");
