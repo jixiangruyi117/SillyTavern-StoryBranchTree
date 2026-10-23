@@ -23,7 +23,14 @@ const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
   .replace('"../../../../script.js"', JSON.stringify(coreStub))
   .replace('"../../../RossAscends-mods.js"', JSON.stringify(enterStub));
 const extension = await import("data:text/javascript," + encodeURIComponent(source
-  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory, updateLayoutBounds, fitCompactText, openLibraryStoryTree };\n//# sourceURL=StoryBranchTree-index.test.js"));
+  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory, updateLayoutBounds, fitCompactText, openLibraryStoryTree, extensionFolderFromUrl };\n//# sourceURL=StoryBranchTree-index.test.js"));
+
+test("UI templates follow renamed extension folders and TT asset URLs", () => {
+  assert.equal(extension.extensionFolderFromUrl("https://example.invalid/prefix/scripts/extensions/third-party/Renamed%20Tree/index.js?v=0.1.84"), "third-party/Renamed Tree");
+  assert.equal(extension.extensionFolderFromUrl("tauri://localhost/scripts/extensions/third-party/%E5%88%86%E6%94%AF%E6%A0%91/index.js"), "third-party/分支树");
+  assert.equal(extension.extensionFolderFromUrl("http://127.0.0.1/scripts/extensions/story-tree/index.js"), "story-tree");
+  assert.throws(() => extension.extensionFolderFromUrl("https://example.invalid/index.js"), /安装目录/);
+});
 
 test("detail bounds use measured terminal heights without iterator helpers", t => {
   const prototype = Object.getPrototypeOf(Object.getPrototypeOf(new Map().values()));

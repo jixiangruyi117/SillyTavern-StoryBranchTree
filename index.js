@@ -36,7 +36,6 @@ const host = createHostCompatibility(tavernCore);
 const { isGenerating } = host;
 const { sendTextareaMessage, updateSwipeCounter } = tavernCore;
 
-const EXTENSION_FOLDER = "third-party/SillyTavern-StoryBranchTree";
 const STORY_LIBRARY_HELP = [
   "同一原生故事归为一项，各路线仍使用独立聊天文件。",
   "查看分支树：打开这个故事的路线关系图；若当前在其他故事，会先打开所选故事的一条聊天。点击树中路线可查看详情并确认切换。",
@@ -111,6 +110,12 @@ function context() {
 
 function uiDocument() {
   return uiSurface?.root ?? document;
+}
+
+function extensionFolderFromUrl(moduleUrl = import.meta.url) {
+  const folder = new URL(moduleUrl).pathname.match(/\/scripts\/extensions\/(.+)\/[^/]+$/)?.[1];
+  if (!folder) throw Error("无法识别剧情分支树的安装目录，请检查扩展安装。");
+  return decodeURIComponent(folder);
 }
 
 async function connectMemoryEnhancement() {
@@ -1920,7 +1925,7 @@ function renderForkButtons() {
   const ctx = context();
   const chat = document.getElementById("chat");
   if (!chat) return;
-  const enabled = isSoloChat(ctx);
+  const enabled = extensionEnabled && Boolean(uiSurface) && typeof chatClickHandler === "function" && isSoloChat(ctx);
   const tree = enabled ? graphFrom(ctx) : null;
   const replyAliases = new Map();
   if (tree && tree.storageMode !== "native") {
@@ -1936,6 +1941,7 @@ function renderForkButtons() {
   for (const messageBlock of chat.querySelectorAll(".mes[mesid]")) {
     const buttonBar = messageBlock.querySelector(".mes_buttons");
     if (!buttonBar) continue;
+    buttonBar.classList.toggle("story-branch-tree__managed-fork", enabled);
     let button = buttonBar.querySelector(':scope > .story-branch-tree__fork-button[data-action="create-branch"]');
     let swipeButton = buttonBar.querySelector(':scope > .story-branch-tree__fork-button[data-action="create-swipe-branch"]');
     let historyButton = buttonBar.querySelector(':scope > .story-branch-tree__fork-button[data-action="view-swipe-history"]');
@@ -2674,18 +2680,23 @@ function installEvents(ctx) {
 }
 
 function installUi(menu, markup) {
+  if (typeof markup !== "string" || !markup.trim()) throw Error("剧情分支树界面模板加载失败，请检查扩展文件并重新加载页面。");
   const template = document.createElement("div");
   template.innerHTML = markup;
   const launcherContainer = template.querySelector("#story-branch-tree-wand-container");
   const launcher = template.querySelector("#story-branch-tree-launcher");
-  const panel = uiDocument().getElementById("story-branch-tree");
-  const newPanel = template.querySelector("#story-branch-tree");
+  const treePanel = template.querySelector("#story-branch-tree");
   const confirmDialog = template.querySelector("#story-branch-tree-confirm");
-  if (!panel && newPanel) uiSurface.root.append(newPanel);
-  if (confirmDialog) uiSurface.root.append(confirmDialog);
-  const treePanel = panel ?? newPanel;
-  if (launcherContainer) menu.append(launcherContainer);
-  if (!treePanel || !launcher) return;
+  const panelRoles = ["canvas", "world", "status", "empty", "mode-picker", "story-library", "note-editor", "floor-detail"];
+  const confirmSelectors = ['[data-role="confirm-title"]', '[data-role="confirm-message"]', '[data-action="confirm-accept"]', '[data-action="confirm-cancel"]'];
+  if (!launcherContainer || !launcher || !treePanel || !confirmDialog
+    || !launcherContainer.contains(launcher)
+    || panelRoles.some(role => !treePanel.querySelector(`[data-role="${role}"]`))
+    || confirmSelectors.some(selector => !confirmDialog.querySelector(selector))) {
+    throw Error("剧情分支树界面模板不完整，请更新扩展并重新加载页面。");
+  }
+  uiSurface.root.append(treePanel, confirmDialog);
+  menu.append(launcherContainer);
   updateAppearance();
   panelClickHandler = async (event) => {
     const button = event.target.closest("[data-action]");
@@ -3259,10 +3270,13 @@ function installUi(menu, markup) {
         .catch((error) => toast("warning", error.message));
       return;
     }
-    const button = event.target.closest(".story-branch-tree__fork-button");
+    const button = event.target.closest(".story-branch-tree__fork-button, .mes_create_branch");
     if (!button) return;
+    const nativeButton = button.classList.contains("mes_create_branch");
+    if (nativeButton && (!isSoloChat(context()) || !button.closest("#chat .mes[mesid]"))) return;
     event.preventDefault();
-    event.stopPropagation();
+    if (nativeButton) event.stopImmediatePropagation();
+    else event.stopPropagation();
     try {
       const messageId = button.closest(".mes")?.getAttribute("mesid");
       const messageIndex = messageId === null || messageId === undefined ? NaN : Number(messageId);
@@ -3319,31 +3333,29 @@ export async function activate() {
   const attempt = uiActivation = {};
   let surface = null;
   try {
-    const markup = await ctx.renderExtensionTemplateAsync(EXTENSION_FOLDER, "settings", {});
+    const markup = await ctx.renderExtensionTemplateAsync(extensionFolderFromUrl(), "settings", {});
     if (uiActivation !== attempt || !extensionEnabled) return;
-    surface = createUiSurface(new URL("./style.css?v=0.1.83", import.meta.url).href);
+    surface = createUiSurface(new URL("./style.css?v=0.1.84", import.meta.url).href);
     uiSurface = surface;
     await surface.ready;
     if (uiActivation !== attempt || !extensionEnabled) return;
     installUi(menu, markup);
+    installEvents(ctx);
+    installPublicApi();
+    disposeRecentStories?.();
+    disposeRecentStories = installRecentStories({ getContext: context });
+    await handleChatLoaded();
+    if (uiActivation === attempt && uiSurface === surface && extensionEnabled) console.info("[StoryBranchTree] Ready");
   } catch (error) {
-    surface?.dispose();
-    if (uiSurface === surface) uiSurface = null;
     if (uiActivation === attempt) {
-      document.getElementById("story-branch-tree-wand-container")?.remove();
+      disable();
       console.error("[StoryBranchTree] Could not load settings panel", error);
-    }
+      toast("error", `剧情分支树启动失败：${error.message}`);
+    } else surface?.dispose();
     return;
   } finally {
     if (uiActivation === attempt) uiActivation = null;
   }
-  if (uiSurface !== surface || !extensionEnabled) return;
-  installEvents(ctx);
-  installPublicApi();
-  disposeRecentStories?.();
-  disposeRecentStories = installRecentStories({ getContext: context });
-  await handleChatLoaded();
-  console.info("[StoryBranchTree] Ready");
 }
 
 export function disable() {
@@ -3411,6 +3423,7 @@ export function disable() {
   document.body.classList.remove("story-branch-tree-open");
   document.body.classList.remove("story-branch-tree-confirm-open");
   document.querySelectorAll(".story-branch-tree__fork-button").forEach((button) => button.remove());
+  document.querySelectorAll(".story-branch-tree__managed-fork").forEach(bar => bar.classList.remove("story-branch-tree__managed-fork"));
   document.querySelectorAll(".mes.story-branch-tree__history-swipes").forEach(row => {
     row.classList.remove("story-branch-tree__history-swipes");
     row.querySelector(".swipes-counter")?.removeAttribute("data-story-swipe-count");

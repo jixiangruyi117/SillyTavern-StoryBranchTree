@@ -1034,6 +1034,11 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   overflow-wrap: anywhere;
 }
 
+/* Hide only the duplicate entry after our single-chat UI has been installed. */
+.mes_buttons.story-branch-tree__managed-fork .mes_create_branch {
+  display: none !important;
+}
+
 .mes .story-branch-tree__fork-button {
   display: inline-flex;
   flex: 0 0 auto;
