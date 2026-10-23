@@ -28,7 +28,7 @@ import { createMuyooMemoryCompatibility, muyooSheetsAtMessages } from "./modules
 import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.77";
 import { installRecentStories } from "./modules/RecentStories.js?v=0.1.81";
 import { createHostCompatibility } from "./modules/HostCompatibility.js?v=0.1.77";
-import { createUiSurface } from "./modules/UiSurface.js?v=0.1.82";
+import { createUiSurface, dismissOnBackdrop } from "./modules/UiSurface.js?v=0.1.85";
 import * as tavernCore from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
 
@@ -88,6 +88,9 @@ let nativeChangeOwner = null;
 let extensionEnabled = true;
 let uiSurface = null;
 let uiActivation = null;
+let menuObserver = null;
+let confirmationReturnFocus = null;
+let detailReturnFocus = null;
 let disposeRecentStories = null;
 const singleMemoryCompatibility = createMuyooMemoryCompatibility({ getContext: context, getApi: () => publicApi,
   getPlugin: () => storyMode(context()) === "single" && !context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")
@@ -1585,7 +1588,7 @@ function showNativeReply(index, swipeId) {
   const routes = nativeStorage.replyRoutes(index, swipeId);
   detail.querySelector('[data-role="reply-actions"]').innerHTML = `<button data-action="reply-previous">上一回复</button><button data-action="reply-next">下一回复</button><button data-action="reply-create">新建路线并继续</button>`
     + routes.map(entry => `<button data-action="reply-existing" data-branch-id="${escapeAttribute(entry.route.id)}">继续：${escapeHtml(entry.route.title)}</button>`).join("");
-  detail.hidden = false;
+  openFloorDetail(detail);
 }
 
 function checkedNativePreview() {
@@ -1598,6 +1601,8 @@ function checkedNativePreview() {
 }
 
 function closeFloorDetail() {
+  const returnFocus = detailReturnFocus;
+  detailReturnFocus = null;
   const detail = uiDocument().querySelector('#story-branch-tree [data-role="floor-detail"]');
   if (detail) {
     detail.hidden = true;
@@ -1605,6 +1610,14 @@ function closeFloorDetail() {
     detail.querySelector('[data-role="reply-actions"]')?.replaceChildren();
   }
   nativePreview = null;
+  if (returnFocus?.isConnected && returnFocus.getClientRects().length) returnFocus.focus({ preventScroll: true });
+}
+
+function openFloorDetail(detail) {
+  const opening = detail.hidden;
+  if (opening) detailReturnFocus = uiDocument().activeElement;
+  detail.hidden = false;
+  if (opening) detail.querySelector('[data-action="close-floor-detail"]')?.focus({ preventScroll: true });
 }
 
 function openTree() {
@@ -1612,6 +1625,7 @@ function openTree() {
   if (!panel) return;
   panel.classList.remove("is-library");
   const toggle = panel.querySelector('[data-action="toggle-view"]');
+  const opening = panel.hidden;
   updateViewToggle(toggle);
   panel.hidden = false;
   panel.querySelector('[data-role="story-library"]')?.setAttribute("hidden", "");
@@ -1622,6 +1636,7 @@ function openTree() {
   uiSurface?.sync();
   view.needsFit = true;
   renderTree();
+  if (opening) panel.querySelector('[data-action="close-tree"]')?.focus({ preventScroll: true });
 }
 
 function updateViewToggle(button) {
@@ -1659,19 +1674,21 @@ function closeTree() {
 }
 
 function closeConfirmation() {
-  const help = pendingConfirmation?.kind === "help";
+  const returnFocus = confirmationReturnFocus;
+  confirmationReturnFocus = null;
   const dialog = uiDocument().getElementById("story-branch-tree-confirm");
   if (dialog) dialog.hidden = true;
   pendingConfirmation = null;
   document.body.classList.remove("story-branch-tree-confirm-open");
   uiSurface?.sync();
-  if (help) uiDocument().querySelector('#story-branch-tree [data-action="story-help"]')?.focus();
+  if (returnFocus?.isConnected && returnFocus.getClientRects().length) returnFocus.focus({ preventScroll: true });
 }
 
 function openConfirmation(request, title, message, acceptLabel) {
   const dialog = uiDocument().getElementById("story-branch-tree-confirm");
   if (!dialog) throw new Error("确认弹窗未加载。");
   const ctx = context();
+  if (dialog.hidden) confirmationReturnFocus = uiDocument().activeElement;
   pendingConfirmation = { ...request, chatId: ctx.chatId, characterId: ctx.characterId, groupId: ctx.groupId };
   dialog.classList.toggle("is-help", request.kind === "help");
   dialog.querySelector('[data-action="confirm-cancel"]').hidden = request.kind === "help";
@@ -1857,8 +1874,7 @@ async function showEndDetail(branchId) {
   const title = getStoryBranchRows(tree).find((row) => row.id === branchId)?.title ?? branch.title;
   detail.querySelector('[data-role="floor-title"]').textContent = `${title} · 第 ${route.length || "—"} 楼`;
   detail.querySelector('[data-role="floor-content"]').textContent = messageContent(route.at(-1)) || "该楼层还没有内容。";
-  detail.hidden = false;
-  detail.querySelector('[data-action="close-floor-detail"]')?.focus();
+  openFloorDetail(detail);
 }
 
 function escapeHtml(value) {
@@ -1887,6 +1903,7 @@ function editNote(title, values = {}, mode = "note") {
   const deleteButton = editor?.querySelector('[data-action="delete-branch"]');
   if (!editor || !titleElement || !branchNameField || !branchNameInput || !pointNameField || !pointNameInput || !branchSummaryField || !branchSummaryInput || !pointSummaryField || !pointSummaryInput || !input || !deleteButton) throw new Error("备注编辑器未加载。");
   pendingNoteEditor?.finish(null);
+  const returnFocus = uiDocument().activeElement;
   titleElement.textContent = title;
   branchNameField.hidden = mode !== "branch";
   pointNameField.hidden = mode !== "node";
@@ -1915,6 +1932,7 @@ function editNote(title, values = {}, mode = "note") {
       settled = true;
       editor.hidden = true;
       pendingNoteEditor = null;
+      if (returnFocus?.isConnected && returnFocus.getClientRects().length) returnFocus.focus({ preventScroll: true });
       resolve(result);
     };
     pendingNoteEditor = { finish };
@@ -2818,15 +2836,9 @@ function installUi(menu, markup) {
       toast("warning", error.message);
     }
   };
-  treePanel.querySelector('[data-role="note-editor"]')?.addEventListener("click", (event) => {
-    if (event.target === event.currentTarget) pendingNoteEditor?.finish(null);
-  });
-  treePanel.querySelector('[data-role="floor-detail"]')?.addEventListener("click", (event) => {
-    if (event.target === event.currentTarget) closeFloorDetail();
-  });
-  confirmDialog?.addEventListener("click", (event) => {
-    if (event.target === event.currentTarget) closeConfirmation();
-  });
+  dismissOnBackdrop(treePanel.querySelector('[data-role="note-editor"]'), () => pendingNoteEditor?.finish(null));
+  dismissOnBackdrop(treePanel.querySelector('[data-role="floor-detail"]'), closeFloorDetail);
+  dismissOnBackdrop(confirmDialog, closeConfirmation);
   treePanel.addEventListener("click", panelClickHandler);
   treePanel.querySelector('[data-role="story-import"]')?.addEventListener("change", async event => {
     const file = event.target.files?.[0];
@@ -3220,23 +3232,34 @@ function installUi(menu, markup) {
   };
   canvas.addEventListener("wheel", canvasWheelHandler, { passive: false });
   canvasKeyHandler = (event) => {
-    if (event.key === "Tab" && pendingConfirmation?.kind === "help" && !confirmDialog.hidden) {
-      event.preventDefault();
-      const message = confirmDialog.querySelector('[data-role="confirm-message"]');
-      const accept = confirmDialog.querySelector('[data-action="confirm-accept"]');
+    if (treePanel.hidden && confirmDialog.hidden) return;
+    // Handle keys inside the ShadowRoot before the page sees a retargeted DIV.
+    // Browser defaults (caret movement, selection and scrolling) stay intact.
+    event.stopPropagation();
+    if (event.isComposing) return;
+    if (event.key === "Tab") {
+      const editor = treePanel.querySelector('[data-role="note-editor"]');
+      const detail = treePanel.querySelector('[data-role="floor-detail"]');
+      const dialog = !confirmDialog.hidden ? confirmDialog : !editor.hidden ? editor : !detail.hidden ? detail : treePanel;
+      const controls = [...dialog.querySelectorAll('button, input, textarea, select, [tabindex]')]
+        .filter(node => !node.disabled && node.tabIndex >= 0 && node.getClientRects().length);
       const focused = uiDocument().activeElement;
-      const next = focused === message ? accept : focused === accept ? message : event.shiftKey ? accept : message;
-      next.focus({ preventScroll: true });
+      const index = controls.indexOf(focused);
+      if (index < 0 || (!event.shiftKey && index === controls.length - 1) || (event.shiftKey && index === 0)) {
+        event.preventDefault();
+        (event.shiftKey ? controls.at(-1) : controls[0])?.focus({ preventScroll: true });
+      }
       return;
     }
     if (event.key !== "Escape") return;
+    event.preventDefault();
     if (confirmDialog && !confirmDialog.hidden) closeConfirmation();
     else if (treePanel.hidden) return;
     else if (pendingNoteEditor) pendingNoteEditor.finish(null);
     else if (!treePanel.querySelector('[data-role="floor-detail"]').hidden) closeFloorDetail();
     else closeTree();
   };
-  document.addEventListener("keydown", canvasKeyHandler);
+  uiSurface.root.addEventListener("keydown", canvasKeyHandler);
   chatClickHandler = (event) => {
     if (event.target.closest("#option_select_chat")) {
       if (originalListOnce) { originalListOnce = false; return; }
@@ -3329,13 +3352,29 @@ export async function activate() {
   const ctx = context();
   if (!ctx) return;
   const menu = document.getElementById("extensionsMenu");
-  if (!menu || uiSurface || uiActivation) return;
+  if (uiSurface || uiActivation) return;
+  if (!menu) {
+    // The host appends its wand menu to body. Watch only those direct additions
+    // while waiting, then release the observer on discovery or disable.
+    if (!menuObserver) {
+      menuObserver = new MutationObserver(() => {
+        if (!document.getElementById("extensionsMenu")) return;
+        menuObserver.disconnect();
+        menuObserver = null;
+        if (extensionEnabled) void activate();
+      });
+      menuObserver.observe(document.body, { childList: true });
+    }
+    return;
+  }
+  menuObserver?.disconnect();
+  menuObserver = null;
   const attempt = uiActivation = {};
   let surface = null;
   try {
     const markup = await ctx.renderExtensionTemplateAsync(extensionFolderFromUrl(), "settings", {});
     if (uiActivation !== attempt || !extensionEnabled) return;
-    surface = createUiSurface(new URL("./style.css?v=0.1.84", import.meta.url).href);
+    surface = createUiSurface(new URL("./style.css?v=0.1.85", import.meta.url).href);
     uiSurface = surface;
     await surface.ready;
     if (uiActivation !== attempt || !extensionEnabled) return;
@@ -3361,6 +3400,8 @@ export async function activate() {
 export function disable() {
   extensionEnabled = false;
   uiActivation = null;
+  menuObserver?.disconnect();
+  menuObserver = null;
   canvasResizeObserver?.disconnect();
   canvasResizeObserver = null;
   if (canvasResizeFrame !== null) cancelAnimationFrame(canvasResizeFrame);
@@ -3380,7 +3421,7 @@ export function disable() {
     for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) canvas?.removeEventListener(type, canvasPointerHandler);
     if (canvas && canvasWheelHandler) canvas.removeEventListener("wheel", canvasWheelHandler);
   }
-  if (canvasKeyHandler) document.removeEventListener("keydown", canvasKeyHandler);
+  if (canvasKeyHandler) uiSurface?.root.removeEventListener("keydown", canvasKeyHandler);
   if (chatClickHandler) document.removeEventListener("click", chatClickHandler, true);
   if (pendingSendGuard) {
     document.removeEventListener("click", pendingSendGuard, true);
@@ -3412,6 +3453,8 @@ export function disable() {
   pendingNoteEditor?.finish(null);
   pendingNoteEditor = null;
   pendingConfirmation = null;
+  confirmationReturnFocus = null;
+  detailReturnFocus = null;
   state.busy = false;
   state.routeSwitching = false;
   // Restore focus while the focused dialog is still connected to the host.

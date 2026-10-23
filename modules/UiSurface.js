@@ -1,3 +1,23 @@
+// A click can target the common ancestor of its press/release targets. Require
+// both ends on the backdrop, so selecting text or dragging out cannot dismiss.
+export function dismissOnBackdrop(overlay, dismiss) {
+  let pointer = null, released = false;
+  overlay.addEventListener("pointerdown", event => {
+    released = false;
+    pointer = event.target === overlay && event.button === 0 && event.isPrimary !== false ? event.pointerId : null;
+  });
+  overlay.addEventListener("pointerup", event => {
+    released = pointer === event.pointerId && event.target === overlay;
+    pointer = null;
+  });
+  overlay.addEventListener("pointercancel", () => { pointer = null; released = false; });
+  overlay.addEventListener("click", event => {
+    const close = released && event.target === overlay;
+    released = false;
+    if (close) dismiss();
+  });
+}
+
 // Keep presentation outside the themed body; custom properties still inherit
 // from the document root, where SillyTavern stores its theme and font settings.
 export function createUiSurface(stylesheetUrl, doc = document) {
