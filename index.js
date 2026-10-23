@@ -48,6 +48,8 @@ const STORY_LIBRARY_HELP = [
 const BRANCH_CHANGED_EVENT = "story-branch-tree:changed";
 const PUBLIC_API_KEY = "SillyTavernStoryBranchTree";
 const API_READY_EVENT = "story-branch-tree:ready";
+const CHAT_READ_ONLY_ACTIONS = new Set(["close-tree", "back-to-tree", "story-library", "story-help", "library-original", "retry-chat",
+  "confirm-cancel", "note-cancel", "close-floor-detail", "toggle-appearance", "zoom-reset", "toggle-view", "legacy-cancel"]);
 const routeAdapters = new Map();
 const memoryTasks = new Set();
 let memoryTaskEpoch = 0;
@@ -91,6 +93,8 @@ let uiActivation = null;
 let menuObserver = null;
 let confirmationReturnFocus = null;
 let detailReturnFocus = null;
+let chatLoadIssue = null;
+let chatLoadEpoch = 0;
 let disposeRecentStories = null;
 const singleMemoryCompatibility = createMuyooMemoryCompatibility({ getContext: context, getApi: () => publicApi,
   getPlugin: () => storyMode(context()) === "single" && !context()?.extensionSettings?.disabledExtensions?.includes("third-party/st-memory-enhancement")
@@ -113,6 +117,24 @@ function context() {
 
 function uiDocument() {
   return uiSurface?.root ?? document;
+}
+
+function chatOwner(ctx = context()) {
+  return { chat: ctx?.chat, metadata: ctx?.chatMetadata, chatId: ctx?.chatId, characterId: ctx?.characterId, groupId: ctx?.groupId };
+}
+
+function ownsChat(owner, ctx = context()) {
+  return owner.chat === ctx?.chat && owner.metadata === ctx?.chatMetadata && owner.chatId === ctx?.chatId
+    && owner.characterId === ctx?.characterId && owner.groupId === ctx?.groupId;
+}
+
+function currentChatIssue(ctx = context()) {
+  return chatLoadIssue && ownsChat(chatLoadIssue, ctx) ? chatLoadIssue.error : null;
+}
+
+function requireChatReady(ctx = context()) {
+  const issue = currentChatIssue(ctx);
+  if (issue) throw issue;
 }
 
 function extensionFolderFromUrl(moduleUrl = import.meta.url) {
@@ -257,6 +279,7 @@ async function abortNativeChange(change, opened) {
 }
 
 async function runNative(action) {
+  requireChatReady();
   if (state.busy || isGenerating()) throw Error("请等待当前操作结束。");
   state.busy = true;
   state.routeSwitching = true;
@@ -318,7 +341,7 @@ function getRouteMessages(branchId, options = {}) {
 }
 
 function isMemoryBlocked(ctx = context()) {
-  return adapterRecoveryKey !== null && adapterRecoveryKey === getActiveRouteKey();
+  return Boolean(currentChatIssue(ctx)) || adapterRecoveryKey !== null && adapterRecoveryKey === getActiveRouteKey();
 }
 
 function getRouteMetadata(adapterId, branchId) {
@@ -394,6 +417,7 @@ function beginMemoryTask(adapterId, options = {}) {
 }
 
 function notifyMemoryChanged(adapterId, options = {}) {
+  requireChatReady();
   const adapter = routeAdapters.get(adapterId);
   if (!adapter) throw new Error("记忆适配器未注册。");
   if (options.task && options.task.adapterId !== adapterId) throw new Error("任务与记忆适配器不匹配。");
@@ -452,6 +476,7 @@ function installPublicApi() {
     restoreReplyMemory: (id, index) => {
       if (publicApi !== api) throw Error("路线记忆接口已停用。");
       const adapter = routeAdapters.get(id), ctx = context();
+      requireChatReady(ctx);
       if (!adapter) throw Error("记忆适配器未注册。");
       if (!isSoloChat(ctx) || state.routeSwitching && adapterRecoveryOwner !== id) throw Error("当前聊天尚未就绪，不能恢复回复记忆。");
       return restoreReplyMemory(ctx.chat[index], adapter.messageFields);
@@ -466,6 +491,7 @@ function installPublicApi() {
 }
 
 function registerRouteAdapter(adapter) {
+  if (currentChatIssue()?.code !== "STORY_BRANCH_CHAT_CHECKING") requireChatReady();
   if (adapter?.messageFields !== undefined && !Array.isArray(adapter.messageFields)) throw new Error("记忆字段必须是数组。");
   if (adapter?.metadataFields !== undefined && !Array.isArray(adapter.metadataFields)) throw new Error("聊天元数据字段必须是数组。");
   const entry = { ...adapter, messageFields: [...(adapter?.messageFields ?? [])], metadataFields: adapterMetadataFieldNames(adapter?.metadataFields ?? []) };
@@ -495,7 +521,7 @@ function registerRouteAdapter(adapter) {
       initializeRegisteredAdapterStates(tree, [entry]);
       captureStoryBranchAdapterState(tree, tree.activeBranchId, ctx.chat, entry.id, entry.messageFields);
       captureAdapterMetadata(ctx, tree, tree.activeBranchId, entry);
-      if (!activeProjection) storeGraph(ctx, tree);
+      if (!activeProjection) storeGraph(ctx, tree, { registeringAdapter: true });
     }
   } catch (error) {
     for (const [branch, saved] of previousStates) {
@@ -576,7 +602,10 @@ function emitBranchChanged(detail) {
   }));
 }
 
-function storeGraph(ctx, tree) {
+function storeGraph(ctx, tree, { registeringAdapter = false } = {}) {
+  // Adapter registration is part of the check itself. Only that path may save
+  // its validated snapshots while the check is pending, never after a failure.
+  if (!registeringAdapter || currentChatIssue(ctx)?.code !== "STORY_BRANCH_CHAT_CHECKING") requireChatReady(ctx);
   if (tree.storageMode === "native") { nativeStorage.saveView(tree); return; }
   ctx.updateChatMetadata({ [TREE_METADATA_KEY]: tree });
   ctx.saveMetadataDebounced?.();
@@ -1129,29 +1158,39 @@ function renderTree() {
   if (!root) return;
   const ctx = context();
   const focusButton = root.querySelector('[data-action="focus-current"]');
-  if (focusButton) focusButton.disabled = !isSoloChat(ctx) || !graphFrom(ctx);
   const status = root.querySelector('[data-role="status"]');
   status.removeAttribute("title");
   const world = root.querySelector('[data-role="world"]');
   const empty = root.querySelector('[data-role="empty"]');
-  if (!isSoloChat(ctx)) {
-    renderedLayout = null;
-    status.textContent = "仅支持单人角色聊天；群聊中不会修改消息或保存剧情树。";
-    world.replaceChildren();
-    empty.hidden = false;
-    empty.textContent = status.textContent;
-    return;
-  }
-  let tree = graphFrom(ctx);
-  if (!tree) {
-    renderedLayout = null;
-    status.textContent = "当前聊天还没有分支。点击任意消息旁的“分支”即可开始。";
-    world.replaceChildren();
-    empty.hidden = false;
-    empty.textContent = status.textContent;
-    return;
-  }
+  empty.classList.remove("is-error");
+  root.classList.remove("has-chat-issue");
+  const picker = root.querySelector('[data-role="mode-picker"]');
+  const retry = root.querySelector('[data-action="retry-chat"]');
+  const original = root.querySelector('.story-branch-tree__toolbar [data-action="library-original"]');
+  if (retry) retry.hidden = true;
+  if (original) original.hidden = true;
+  if (picker) picker.hidden = true;
   try {
+    requireChatReady(ctx);
+    if (focusButton) focusButton.disabled = !isSoloChat(ctx) || !graphFrom(ctx);
+    if (!isSoloChat(ctx)) {
+      renderedLayout = null;
+      status.textContent = "仅支持单人角色聊天；群聊中不会修改消息或保存剧情树。";
+      world.replaceChildren();
+      empty.hidden = false;
+      empty.textContent = status.textContent;
+      return;
+    }
+    const tree = graphFrom(ctx);
+    if (picker && !root.classList.contains("is-library")) picker.hidden = Boolean(storyMode(ctx));
+    if (!tree) {
+      renderedLayout = null;
+      status.textContent = "当前聊天还没有分支。点击任意消息旁的“分支”即可开始。";
+      world.replaceChildren();
+      empty.hidden = false;
+      empty.textContent = status.textContent;
+      return;
+    }
     const branches = getStoryBranchRows(tree);
     const current = tree.branches[tree.activeBranchId];
     if (focusButton && current.pendingSwipe) focusButton.disabled = true;
@@ -1312,10 +1351,26 @@ function renderTree() {
     else applyView();
   } catch (error) {
     renderedLayout = null;
-    status.textContent = error.message;
+    root.classList.add("has-chat-issue");
+    // Do not leave a tree drag active while the same area displays a scrollable error.
+    clearTimeout(cardPointer?.timer);
+    cardPointer = null;
+    activeTouchPointers.clear();
+    pinchGesture = null;
+    view.dragging = false;
+    view.pointerId = null;
+    root.querySelector('[data-role="canvas"]')?.classList.remove("is-dragging");
+    if (focusButton) focusButton.disabled = true;
+    if (picker) picker.hidden = true;
+    const checking = error.code === "STORY_BRANCH_CHAT_CHECKING";
+    if (retry) retry.hidden = checking;
+    if (original) original.hidden = checking;
+    status.textContent = checking ? "正在检查当前故事" : "当前故事检查失败";
+    status.title = error.message;
     world.replaceChildren();
     empty.hidden = false;
-    empty.textContent = error.message;
+    empty.classList.add("is-error");
+    empty.textContent = checking ? error.message : `${error.message}\n\n分支树入口仍可使用，当前故事的分支操作暂停。处理原因后点击“重试检查”，必要时更新插件并刷新页面；也可从“原始记录”打开其他聊天。`;
   }
 }
 
@@ -1457,6 +1512,7 @@ function requestStoryMode(action) {
 }
 
 async function chooseStoryMode(mode) {
+  requireChatReady();
   const ctx = context();
   const owner = { chat: ctx.chat, chatId: ctx.chatId, characterId: ctx.characterId };
   const request = pendingModeAction;
@@ -1492,7 +1548,8 @@ async function openStoryLibrary(rebuild = false) {
   root.querySelector('[data-role="canvas"]').hidden = true;
   const library = root.querySelector('[data-role="story-library"]');
   library.hidden = false;
-  library.innerHTML = `<div class="story-branch-tree__library-tools">${storyMode(ctx) !== "single" ? '<button data-action="legacy-find">从当前聊天查找整个故事</button>' : ""}<button data-action="library-rebuild">重建分组</button><button data-action="library-original">查看原始记录</button><button data-action="import-story">导入故事</button>${storyMode(ctx) === "native" ? '<button data-action="export-route">导出当前路线</button>' : ""}</div>`
+  const mode = currentChatIssue(ctx) ? null : storyMode(ctx);
+  library.innerHTML = `<div class="story-branch-tree__library-tools">${mode !== "single" ? '<button data-action="legacy-find">从当前聊天查找整个故事</button>' : ""}<button data-action="library-rebuild">重建分组</button><button data-action="library-original">查看原始记录</button><button data-action="import-story">导入故事</button>${mode === "native" ? '<button data-action="export-route">导出当前路线</button>' : ""}</div>`
     + libraryEntries.map((entry, index) => `<article class="story-branch-tree__library-entry"><h3>${escapeHtml(entry.title)}</h3><p>${entry.routes.length} 条${entry.storyId ? "原生路线" : "聊天记录"}</p><div><button data-action="library-open" data-entry="${index}">继续</button>${entry.storyId ? `<button data-action="library-tree" data-entry="${index}">查看分支树</button><button data-action="library-export" data-entry="${index}">导出故事</button><button data-action="library-delete" data-entry="${index}">删除故事</button>` : ""}</div></article>`).join("");
 }
 
@@ -1630,8 +1687,6 @@ function openTree() {
   panel.hidden = false;
   panel.querySelector('[data-role="story-library"]')?.setAttribute("hidden", "");
   panel.querySelector('[data-role="canvas"]')?.removeAttribute("hidden");
-  const picker = panel.querySelector('[data-role="mode-picker"]');
-  if (picker) picker.hidden = Boolean(storyMode(context()));
   document.body.classList.add("story-branch-tree-open");
   uiSurface?.sync();
   view.needsFit = true;
@@ -1944,7 +1999,7 @@ function renderForkButtons() {
   const chat = document.getElementById("chat");
   if (!chat) return;
   const enabled = extensionEnabled && Boolean(uiSurface) && typeof chatClickHandler === "function" && isSoloChat(ctx);
-  const tree = enabled ? graphFrom(ctx) : null;
+  const tree = enabled && !currentChatIssue(ctx) ? graphFrom(ctx) : null;
   const replyAliases = new Map();
   if (tree && tree.storageMode !== "native") {
     for (let branch = tree.branches[tree.activeBranchId]; branch; branch = tree.branches[branch.parentBranchId]) {
@@ -2036,10 +2091,18 @@ function renderForkButtons() {
 function refreshUi({ chatButtons = true } = {}) {
   if (!extensionEnabled) return;
   if (!uiDocument().getElementById("story-branch-tree")?.hidden) renderTree();
-  if (chatButtons) renderForkButtons();
+  if (chatButtons) {
+    try { renderForkButtons(); }
+    catch (error) {
+      invalidateMemoryTasks();
+      chatLoadIssue = { ...chatOwner(), error };
+      if (!uiDocument().getElementById("story-branch-tree")?.hidden) renderTree();
+    }
+  }
 }
 
 async function autoArrangeTree() {
+  requireChatReady();
   if (state.busy || isGenerating()) throw new Error("请等当前生成结束后再整理剧情树。");
   const ctx = context();
   if (!isSoloChat(ctx)) throw new Error("剧情分支树仅支持单人角色聊天。");
@@ -2077,6 +2140,7 @@ function applySyncedMessageIds(liveMessages, syncedMessages) {
 
 function syncLiveChat({ allowInitialize = false } = {}) {
   const ctx = context();
+  requireChatReady(ctx);
   if (!isSoloChat(ctx)) return null;
   if (storyMode(ctx) === "native") return nativeStorage.syncCurrent();
   let tree = graphFrom(ctx);
@@ -2549,6 +2613,7 @@ async function returnToForkNode(branchId) {
 
 async function saveCardPosition(branchId, position) {
   const ctx = context();
+  requireChatReady(ctx);
   const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree?.branches[branchId]) throw new Error("保存分支位置失败：路线已不存在。");
   tree.layout ??= {};
@@ -2559,6 +2624,7 @@ async function saveCardPosition(branchId, position) {
 
 async function saveForkPosition(forkId, position, narrow) {
   const ctx = context();
+  requireChatReady(ctx);
   const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree) throw new Error("保存分叉点位置失败：剧情树已不存在。");
   tree.layout ??= {};
@@ -2569,6 +2635,7 @@ async function saveForkPosition(forkId, position, narrow) {
 
 async function saveCompactPosition(kind, id, position, narrow) {
   const ctx = context();
+  requireChatReady(ctx);
   const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree) throw new Error("保存简略视图位置失败：剧情树已不存在。");
   tree.compactLayout ??= { points: {}, leaves: {} };
@@ -2580,6 +2647,7 @@ async function saveCompactPosition(kind, id, position, narrow) {
 
 async function saveEndingPosition(branchId, position, narrow) {
   const ctx = context();
+  requireChatReady(ctx);
   const tree = isSoloChat(ctx) ? graphFrom(ctx) : null;
   if (!tree?.branches[branchId]) throw new Error("保存终点位置失败：路线已不存在。");
   tree.layout ??= {};
@@ -2605,12 +2673,12 @@ function restoreProtectedProjection(error) {
 
 function handleMessageChanged() {
   const ctx = context();
-  if (state.busy || host.isSwiping() || !isSoloChat(ctx)) return;
-  if (!graphFrom(ctx)) {
-    renderForkButtons();
-    return;
-  }
+  if (state.busy || host.isSwiping() || !isSoloChat(ctx) || currentChatIssue(ctx)) return;
   try {
+    if (!graphFrom(ctx)) {
+      renderForkButtons();
+      return;
+    }
     const tree = syncLiveChat();
     const active = tree.branches[tree.activeBranchId];
     if (active.pendingSwipe && active.messageIds.length > 1) {
@@ -2640,23 +2708,43 @@ function repairCompletedSwipeIndices(messages) {
 }
 
 async function handleChatLoaded() {
-  if (!state.routeSwitching) invalidateMemoryTasks();
+  await checkCurrentChat();
+}
+
+async function checkCurrentChat(synchronize = true) {
+  if (synchronize && !state.routeSwitching) invalidateMemoryTasks();
   if (state.busy || host.isSwiping() || isGenerating()) return;
-  await connectMemoryEnhancement();
   const ctx = context();
-  if (isSoloChat(ctx) && graphFrom(ctx)) {
-    try {
-      const repaired = repairCompletedSwipeIndices(ctx.chat);
-      syncLiveChat();
-      if (repaired.length) {
-        await Promise.all(repaired.map((index) => updateSwipeCounter(index)));
-        await ctx.saveChat?.();
+  const owner = chatOwner(ctx), epoch = ++chatLoadEpoch;
+  const current = () => epoch === chatLoadEpoch && ownsChat(owner);
+  chatLoadIssue = { ...owner, error: Object.assign(Error("正在检查记忆适配和聊天存档，请稍候。"), { code: "STORY_BRANCH_CHAT_CHECKING" }) };
+  try {
+    await connectMemoryEnhancement();
+    if (!current()) return;
+    chatLoadIssue = null;
+    if (synchronize && isSoloChat(ctx) && graphFrom(ctx)) {
+      try {
+        const repaired = repairCompletedSwipeIndices(ctx.chat);
+        syncLiveChat();
+        if (repaired.length) {
+          await Promise.all(repaired.map((index) => updateSwipeCounter(index)));
+          if (!current()) return;
+          await ctx.saveChat?.();
+        }
+      } catch (error) {
+        if (error.code !== "STORY_BRANCH_PROTECTED_CHANGE") throw error;
+        toast("warning", error.message);
       }
-    } catch (error) {
-      toast("warning", error.message);
     }
+  } catch (error) {
+    if (!current()) return;
+    invalidateMemoryTasks();
+    chatLoadIssue = { ...owner, error };
+    console.warn("[StoryBranchTree] Chat check failed; launcher retained", error);
+    toast("warning", `分支树已加载，当前故事检查失败：${error.message}`);
   }
-  refreshUi();
+  if (!current()) return;
+  refreshUi({ chatButtons: synchronize || Boolean(currentChatIssue()) });
 }
 
 function bindEvent(eventSource, eventName, handler) {
@@ -2670,7 +2758,9 @@ function installEvents(ctx) {
   const types = ctx.eventTypes ?? ctx.event_types ?? {};
   if (!eventSource) return;
   bindEvent(eventSource, types.APP_READY, async () => {
-    try { await connectMemoryEnhancement(); } catch (error) { toast("warning", error.message); }
+    // Healthy chats already synchronized on load; retry the full check only
+    // when earlier adapter readiness or chat validation failed.
+    await checkCurrentChat(Boolean(currentChatIssue()));
   });
   for (const key of ["MESSAGE_SENT", "MESSAGE_RECEIVED", "MESSAGE_SWIPED", "MESSAGE_EDITED", "MESSAGE_UPDATED", "MESSAGE_SWIPE_DELETED"]) {
     bindEvent(eventSource, types[key], (...args) => {
@@ -2732,6 +2822,13 @@ function installUi(menu, markup) {
       return;
     }
     try {
+      const readOnly = CHAT_READ_ONLY_ACTIONS.has(button.dataset.action)
+        || button.dataset.action === "confirm-accept" && pendingConfirmation?.kind === "help";
+      if (!readOnly) requireChatReady();
+      if (button.dataset.action === "retry-chat") {
+        if (state.busy || host.isSwiping() || isGenerating()) throw Error("请等当前操作结束后再检查。");
+        await handleChatLoaded();
+      }
       if (button.dataset.action === "back-to-tree") openTree();
       if (button.dataset.action === "mode-single") await chooseStoryMode("single");
       if (button.dataset.action === "mode-native") await chooseStoryMode("native");
@@ -2866,6 +2963,7 @@ function installUi(menu, markup) {
   });
   const canvas = treePanel.querySelector('[data-role="canvas"]');
   canvasPointerHandler = (event) => {
+    if (treePanel.classList.contains("has-chat-issue")) return;
     if (event.pointerType === "touch") {
       if (event.type === "pointerdown") {
         activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -3227,6 +3325,7 @@ function installUi(menu, markup) {
     canvasResizeObserver.observe(canvas);
   }
   canvasWheelHandler = (event) => {
+    if (treePanel.classList.contains("has-chat-issue")) return;
     event.preventDefault();
     zoomAt(view.scale * (event.deltaY < 0 ? 1.1 : 1 / 1.1), event.clientX, event.clientY);
   };
@@ -3261,6 +3360,12 @@ function installUi(menu, markup) {
   };
   uiSurface.root.addEventListener("keydown", canvasKeyHandler);
   chatClickHandler = (event) => {
+    if (currentChatIssue() && event.target.closest('.story-branch-tree__fork-button, .mes_create_branch, .story-branch-tree__history-swipes .swipe_left, .story-branch-tree__history-swipes .swipe_right')) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      openTree();
+      return;
+    }
     if (event.target.closest("#option_select_chat")) {
       if (originalListOnce) { originalListOnce = false; return; }
       const ctx = context();
@@ -3317,13 +3422,21 @@ function installUi(menu, markup) {
 
 function handlePendingSend(event) {
     const ctx = context();
-    const branch = graphFrom(ctx)?.branches?.[graphFrom(ctx)?.activeBranchId];
     if (!isSoloChat(ctx)) return;
     const clickSend = event.type === "click" && event.target.closest?.("#send_but");
     const keySend = event.type === "keydown" && event.target.id === "send_textarea"
       && event.key === "Enter" && !event.isComposing && !event.shiftKey && !event.altKey
       && (!event.ctrlKey || Boolean(event.target.value)) && shouldSendOnEnter();
     if (!clickSend && !keySend) return;
+    if (currentChatIssue(ctx)) {
+      if (ctx.chatMetadata?.[TREE_METADATA_KEY] || ctx.chatMetadata?.[NATIVE_KEY]) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        toast("warning", currentChatIssue(ctx).message);
+      }
+      return;
+    }
+    const tree = graphFrom(ctx), branch = tree?.branches?.[tree.activeBranchId];
     if (state.routeSwitching) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -3345,6 +3458,19 @@ function handlePendingSend(event) {
     } catch (error) {
       toast("warning", error.message);
     }
+}
+
+export async function enable() {
+  // The host does not load page CSS for a first enable without its requested
+  // reload. Re-enabling an already loaded extension can reuse that stylesheet.
+  const stylesheet = new URL("./style.css", import.meta.url);
+  const loaded = [...document.querySelectorAll('link[rel="stylesheet"]')]
+    .some(link => link.href && new URL(link.href).pathname === stylesheet.pathname);
+  if (!loaded) {
+    toast("info", "剧情分支树已设为启用，首次启用请按酒馆提示刷新页面。");
+    return;
+  }
+  await activate();
 }
 
 export async function activate() {
@@ -3374,7 +3500,7 @@ export async function activate() {
   try {
     const markup = await ctx.renderExtensionTemplateAsync(extensionFolderFromUrl(), "settings", {});
     if (uiActivation !== attempt || !extensionEnabled) return;
-    surface = createUiSurface(new URL("./style.css?v=0.1.85", import.meta.url).href);
+    surface = createUiSurface(new URL("./style.css?v=0.1.86", import.meta.url).href);
     uiSurface = surface;
     await surface.ready;
     if (uiActivation !== attempt || !extensionEnabled) return;
@@ -3399,6 +3525,8 @@ export async function activate() {
 
 export function disable() {
   extensionEnabled = false;
+  chatLoadEpoch++;
+  chatLoadIssue = null;
   uiActivation = null;
   menuObserver?.disconnect();
   menuObserver = null;

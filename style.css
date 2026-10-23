@@ -287,6 +287,11 @@ body.story-branch-tree-confirm-open {
   cursor: grabbing;
 }
 
+.story-branch-tree.has-chat-issue .story-branch-tree__canvas {
+  touch-action: pan-y;
+  cursor: auto;
+}
+
 .story-branch-tree__world {
   position: absolute;
   top: 0;
@@ -809,11 +814,19 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   place-items: center;
   padding: 2em;
   text-align: center;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
   opacity: 0.75;
 }
 
 .story-branch-tree__empty[hidden] {
   display: none;
+}
+
+.story-branch-tree__empty.is-error {
+  display: block;
+  text-align: left;
 }
 
 .story-branch-tree__note-editor {

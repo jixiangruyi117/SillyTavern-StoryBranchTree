@@ -23,7 +23,7 @@ const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
   .replace('"../../../../script.js"', JSON.stringify(coreStub))
   .replace('"../../../RossAscends-mods.js"', JSON.stringify(enterStub));
 const extension = await import("data:text/javascript," + encodeURIComponent(source
-  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory, updateLayoutBounds, fitCompactText, openLibraryStoryTree, extensionFolderFromUrl };\n//# sourceURL=StoryBranchTree-index.test.js"));
+  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory, updateLayoutBounds, fitCompactText, openLibraryStoryTree, extensionFolderFromUrl, currentChatIssue, runNative, forkFromMessage };\n//# sourceURL=StoryBranchTree-index.test.js"));
 
 test("UI templates follow renamed extension folders and TT asset URLs", () => {
   assert.equal(extension.extensionFolderFromUrl("https://example.invalid/prefix/scripts/extensions/third-party/Renamed%20Tree/index.js?v=0.1.84"), "third-party/Renamed Tree");
@@ -156,6 +156,115 @@ test("ordinary chat loading synchronizes its data without requiring a mounted tr
   await extension.handleChatLoaded();
   const tree = ctx.chatMetadata.story_branch_tree;
   assert.equal(resolveStoryBranch(tree)[0].mes, "加载后的正文");
+});
+
+function chatCheckFixture(t) {
+  const fixture = setup(t);
+  t.mock.method(console, "warn", () => {});
+  const saved = ["document", "toastr"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]);
+  globalThis.document = { getElementById: () => null };
+  globalThis.toastr = { warning() {} };
+  const ensure = extension.singleMemoryCompatibility.ensure;
+  t.after(() => {
+    extension.singleMemoryCompatibility.ensure = ensure;
+    for (const [key, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  });
+  return fixture;
+}
+
+test("chat check failures block branch, layout and memory writes before mutation", async t => {
+  const { ctx, api } = chatCheckFixture(t);
+  const unregister = api.registerRouteAdapter({ id: "chat-check", messageFields: ["CheckMemory"] });
+  t.after(unregister);
+  const before = JSON.stringify({ chat: ctx.chat, metadata: ctx.chatMetadata });
+  extension.singleMemoryCompatibility.ensure = async () => { throw Error("adapter unavailable"); };
+  await extension.handleChatLoaded();
+  assert.match(extension.currentChatIssue().message, /adapter unavailable/);
+  assert.throws(() => extension.syncLiveChat(), /adapter unavailable/);
+  await assert.rejects(extension.forkFromMessage(0), /adapter unavailable/);
+  await assert.rejects(extension.saveCardPosition(ctx.chatMetadata.story_branch_tree.activeBranchId, { x: 1, y: 2 }), /adapter unavailable/);
+  let nativeCalls = 0;
+  await assert.rejects(extension.runNative(async () => nativeCalls++), /adapter unavailable/);
+  assert.equal(nativeCalls, 0);
+  assert.throws(() => api.notifyMemoryChanged("chat-check"), /adapter unavailable/);
+  assert.throws(() => api.restoreReplyMemory("chat-check", 0), /adapter unavailable/);
+  assert.equal(JSON.stringify({ chat: ctx.chat, metadata: ctx.chatMetadata }), before);
+});
+
+test("a successful explicit chat check releases its error without weakening memory preparation", async t => {
+  const { ctx } = chatCheckFixture(t);
+  extension.singleMemoryCompatibility.ensure = async () => { throw Error("temporary adapter failure"); };
+  await extension.handleChatLoaded();
+  assert.ok(extension.currentChatIssue());
+  extension.singleMemoryCompatibility.ensure = async () => {};
+  await extension.handleChatLoaded();
+  assert.equal(extension.currentChatIssue(), null);
+  ctx.chat[0].mes = "recovered text";
+  extension.syncLiveChat();
+  assert.equal(resolveStoryBranch(ctx.chatMetadata.story_branch_tree)[0].mes, "recovered text");
+  extension.singleMemoryCompatibility.ensure = async () => { throw Error("branch preparation still required"); };
+  await assert.rejects(extension.forkFromMessage(0), /branch preparation still required/);
+});
+
+test("valid adapter registration can save its snapshots during the chat check", async t => {
+  const { ctx, api } = chatCheckFixture(t);
+  let unregister;
+  t.after(() => unregister?.());
+  extension.singleMemoryCompatibility.ensure = async () => {
+    unregister ??= api.registerRouteAdapter({ id: "startup-adapter", messageFields: ["CheckMemory"] });
+  };
+  ctx.chat[0].CheckMemory = "ready";
+  await extension.handleChatLoaded();
+  assert.equal(extension.currentChatIssue(), null);
+  assert.equal(resolveStoryBranch(ctx.chatMetadata.story_branch_tree)[0].CheckMemory, "ready");
+});
+
+test("mixed storage markers stay untouched and recover only after the conflict is removed", async t => {
+  const { ctx } = chatCheckFixture(t);
+  extension.singleMemoryCompatibility.ensure = async () => {};
+  ctx.chatMetadata.story_branch_tree_native = { fixture: "conflict" };
+  const before = JSON.stringify(ctx.chatMetadata);
+  await extension.handleChatLoaded();
+  assert.match(extension.currentChatIssue().message, /两种剧情存档/);
+  assert.equal(JSON.stringify(ctx.chatMetadata), before);
+  delete ctx.chatMetadata.story_branch_tree_native;
+  await extension.handleChatLoaded();
+  assert.equal(extension.currentChatIssue(), null);
+});
+
+test("invalid story data during synchronization blocks writes instead of dismissing the entry", async t => {
+  const { ctx } = chatCheckFixture(t);
+  extension.singleMemoryCompatibility.ensure = async () => {};
+  ctx.chatMetadata.story_branch_tree.version = 999;
+  const before = JSON.stringify({ chat: ctx.chat, metadata: ctx.chatMetadata });
+  await extension.handleChatLoaded();
+  assert.ok(extension.currentChatIssue());
+  assert.throws(() => extension.syncLiveChat());
+  assert.equal(JSON.stringify({ chat: ctx.chat, metadata: ctx.chatMetadata }), before);
+});
+
+test("a pending or late failed check cannot mutate or block the newly opened chat", async t => {
+  const { ctx } = chatCheckFixture(t);
+  let rejectOld;
+  extension.singleMemoryCompatibility.ensure = () => new Promise((_, reject) => { rejectOld = reject; });
+  const oldCheck = extension.handleChatLoaded();
+  assert.equal(extension.currentChatIssue().code, "STORY_BRANCH_CHAT_CHECKING");
+  const before = JSON.stringify(ctx.chatMetadata);
+  assert.throws(() => extension.syncLiveChat(), /正在检查/);
+  assert.equal(JSON.stringify(ctx.chatMetadata), before);
+  ctx.chatId = "new-chat";
+  ctx.chat = [{ mes: "new chat", is_user: true }];
+  ctx.chatMetadata = {};
+  extension.singleMemoryCompatibility.ensure = async () => {};
+  await extension.handleChatLoaded();
+  const newChat = JSON.stringify({ chat: ctx.chat, metadata: ctx.chatMetadata });
+  rejectOld(Error("old chat adapter failure"));
+  await oldCheck;
+  assert.equal(extension.currentChatIssue(), null);
+  assert.equal(JSON.stringify({ chat: ctx.chat, metadata: ctx.chatMetadata }), newChat);
 });
 
 test("viewing a library tree preserves the current route and rejects stale story identity", async t => {
