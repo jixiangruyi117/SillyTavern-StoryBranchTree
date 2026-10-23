@@ -60,7 +60,9 @@ body.story-branch-tree-confirm-open {
 
 #story-branch-tree [hidden] { display: none !important; }
 #story-branch-tree:not(.is-library) [data-action="back-to-tree"],
-#story-branch-tree.is-library .story-branch-tree__toolbar button:not([data-action="back-to-tree"], [data-action="toggle-appearance"]) { display: none; }
+#story-branch-tree:not(.is-library) [data-action="story-help"],
+#story-branch-tree.is-library .story-branch-tree__toolbar button:not([data-action="back-to-tree"], [data-action="toggle-appearance"], [data-action="story-help"]) { display: none; }
+#story-branch-tree.is-library .story-branch-tree__toolbar [data-action="toggle-appearance"] { margin-left: auto; }
 .story-branch-tree__mode-picker,
 .story-branch-tree__library { overflow: auto; padding: 1em; }
 .story-branch-tree__mode-picker button {
@@ -893,6 +895,14 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   overflow-wrap: anywhere;
 }
 
+#story-branch-tree-confirm.is-help [data-role="confirm-message"] {
+  white-space: pre-line;
+}
+
+#story-branch-tree-confirm [data-action="confirm-cancel"][hidden] {
+  display: none;
+}
+
 .story-branch-tree__confirm-card [data-action="confirm-accept"] {
   border-color: var(--SmartThemeQuoteColor, #b9915a);
 }
@@ -1076,14 +1086,46 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 6px;
 }
 
-.story-branch-tree__recent-toggle {
-  min-height: 44px;
+#chat .welcomePanel .story-branch-tree__recent-toggle {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
   width: max-content;
+  margin: 0;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: calc(var(--mainFontSize, 16px) * 0.8);
+  font-weight: 400;
+  line-height: 1.4;
+  opacity: 0.75;
+  cursor: pointer;
   white-space: nowrap;
   flex: 0 0 auto;
+}
+
+#chat .welcomePanel .story-branch-tree__recent-toggle:hover,
+#chat .welcomePanel .story-branch-tree__recent-toggle:focus-visible {
+  opacity: 1;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+#chat .welcomePanel .story-branch-tree__recent-toggle:focus-visible {
+  outline: 2px solid var(--interactable-outline-color, currentColor);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  #chat .welcomePanel .story-branch-tree__recent-toggle {
+    min-height: 32px;
+  }
 }
 
 .story-branch-tree__recent-badge {

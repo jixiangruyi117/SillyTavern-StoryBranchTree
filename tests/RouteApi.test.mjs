@@ -22,7 +22,7 @@ const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
   .replace('"../../../../script.js"', JSON.stringify(coreStub))
   .replace('"../../../RossAscends-mods.js"', JSON.stringify(enterStub));
 const extension = await import("data:text/javascript," + encodeURIComponent(source
-  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory, updateLayoutBounds, fitCompactText };\n//# sourceURL=StoryBranchTree-index.test.js"));
+  + "\nexport { installPublicApi, removePublicApi, replaceActiveProjection, handlePendingSend, syncLiveChat, handleMessageChanged, openBranchSwitchConfirm, invalidateMemoryTasks, clampViewScale, fitView, zoomAt, view, saveCardPosition, saveForkPosition, saveCompactPosition, saveEndingPosition, historicalReplySource, routeUsesReply, nativeStorage, handleChatLoaded, singleMemoryCompatibility, ensureSingleMemory, updateLayoutBounds, fitCompactText, openLibraryStoryTree };\n//# sourceURL=StoryBranchTree-index.test.js"));
 
 test("detail bounds use measured terminal heights without iterator helpers", t => {
   const prototype = Object.getPrototypeOf(Object.getPrototypeOf(new Map().values()));
@@ -148,6 +148,50 @@ test("ordinary chat loading synchronizes its data without requiring a mounted tr
   await extension.handleChatLoaded();
   const tree = ctx.chatMetadata.story_branch_tree;
   assert.equal(resolveStoryBranch(tree)[0].mes, "加载后的正文");
+});
+
+test("viewing a library tree preserves the current route and rejects stale story identity", async t => {
+  const { ctx } = setup(t);
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "document");
+  globalThis.document = { getElementById: () => null };
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "document", previous); else delete globalThis.document; });
+  ctx.chatMetadata = { story_branch_tree_native: { storyId: "current-story" } };
+  ctx.saveChat = async () => { throw Error("view must not save the current route"); };
+  ctx.openCharacterChat = async () => { throw Error("view must not switch within the current story"); };
+  const entry = { storyId: "current-story", routes: [{ chatName: ctx.chatId, updated: 1 }, { chatName: "newer", updated: 2 }] };
+  await extension.openLibraryStoryTree(entry);
+  await assert.rejects(extension.openLibraryStoryTree({ ...entry, storyId: "stale-story" }), /故事记录已改变/);
+  await assert.rejects(extension.openLibraryStoryTree({ ...entry, routes: [] }), /故事列表已改变/);
+});
+
+test("viewing another story opens its newest route and validates the loaded story and character", async t => {
+  const { ctx } = setup(t);
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "document");
+  globalThis.document = { getElementById: () => null };
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "document", previous); else delete globalThis.document; });
+  ctx.characters = [{ avatar: "library.png", name: "Library" }];
+  ctx.extensionSettings = {};
+  const entry = { storyId: "target-story", routes: [{ chatName: "older", updated: 1 }, { chatName: "newest", updated: 2 }] };
+  const calls = [];
+  let loadedStory = entry.storyId, loadedCharacter = 0;
+  ctx.saveChat = async () => { calls.push(["save", ctx.chatId]); };
+  ctx.openCharacterChat = async chatName => {
+    calls.push(["open", chatName]);
+    ctx.chatId = chatName;
+    ctx.chatMetadata = { story_branch_tree_native: { version: 1, storyId: loadedStory, rootRouteId: "root", storyTitle: "Story",
+      route: { id: "root", parentBranchId: null, title: "主线", endFloor: ctx.chat.length, replies: {} } } };
+    ctx.characterId = loadedCharacter;
+  };
+  const reset = () => { ctx.chatId = "source"; ctx.chatMetadata = {}; ctx.characterId = 0; calls.length = 0; };
+  reset();
+  await extension.openLibraryStoryTree(entry);
+  assert.deepEqual(calls, [["save", "source"], ["open", "newest"]]);
+  assert.equal(ctx.chatMetadata.story_branch_tree_native.storyId, entry.storyId);
+  reset(); loadedStory = "replacement-story";
+  await assert.rejects(extension.openLibraryStoryTree(entry), /故事记录已改变/);
+  reset(); loadedStory = entry.storyId; loadedCharacter = 1;
+  ctx.characters.push({ avatar: "other.png", name: "Other" });
+  await assert.rejects(extension.openLibraryStoryTree(entry), /故事记录已改变/);
 });
 
 test("ordinary synchronization does not recapture all replies; explicit route preparation captures once", async t => {

@@ -51,10 +51,11 @@ export function installRecentStories({ getContext, chat = globalThis.document?.g
     let expanded = false;
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "menu_button story-branch-tree__recent-toggle";
+    button.className = "story-branch-tree__recent-toggle interactable";
     function apply() {
       for (const node of folded) node.classList.toggle("story-branch-tree__recent-folded", !expanded);
-      button.textContent = expanded ? "按故事归组" : "显示各路线记录";
+      button.textContent = expanded ? "收起路线" : "展开路线";
+      button.title = expanded ? "将同一故事的路线收起为一项" : "显示每条路线的独立聊天记录";
       button.setAttribute("aria-expanded", String(expanded));
     }
     const toggle = event => { event.stopPropagation(); expanded = !expanded; apply(); };

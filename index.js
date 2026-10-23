@@ -26,7 +26,7 @@ import { captureMemoryState } from "./modules/MemoryState.js?v=0.1.75";
 import { installMemoryEnhancementBridge } from "./modules/MemoryEnhancementBridge.js?v=0.1.75";
 import { createMuyooMemoryCompatibility, muyooSheetsAtMessages } from "./modules/MuyooMemory.js?v=0.1.75";
 import { NativeStoryStorage, NATIVE_KEY, MODE_KEY, storyMode, nativeRows } from "./modules/NativeStory.js?v=0.1.77";
-import { installRecentStories } from "./modules/RecentStories.js?v=0.1.75";
+import { installRecentStories } from "./modules/RecentStories.js?v=0.1.81";
 import { createHostCompatibility } from "./modules/HostCompatibility.js?v=0.1.77";
 import * as tavernCore from "../../../../script.js";
 import { shouldSendOnEnter } from "../../../RossAscends-mods.js";
@@ -36,6 +36,15 @@ const { isGenerating } = host;
 const { sendTextareaMessage, updateSwipeCounter } = tavernCore;
 
 const EXTENSION_FOLDER = "third-party/SillyTavern-StoryBranchTree";
+const STORY_LIBRARY_HELP = [
+  "同一原生故事归为一项，各路线仍使用独立聊天文件。",
+  "查看分支树：打开这个故事的路线关系图；若当前在其他故事，会先打开所选故事的一条聊天。点击树中路线可查看详情并确认切换。",
+  "查找整个故事：从当前主线或子分支查找安装前的旧原生分支，核对并勾选后整理。只按明确来源关联查找，不根据相似名称收录聊天；来源丢失或文件改名可能找不全。",
+  "重建分组：恢复已有故事标记的聊天分组。未整理的旧原生分支请使用“查找整个故事”。",
+  "查看原始记录：进入酒馆原有聊天管理，逐条查看聊天文件。",
+  "导入与导出：导出故事保存全部路线及布局，使用“导入故事”恢复；“导出当前路线”得到可独立导入酒馆的普通聊天。",
+  "整理旧分支时，各聊天文件与记忆仍分别保留，不会补回过去未保存的记忆；来源聊天已删除时，也不能恢复已删正文。",
+].join("\n\n");
 const BRANCH_CHANGED_EVENT = "story-branch-tree:changed";
 const PUBLIC_API_KEY = "SillyTavernStoryBranchTree";
 const API_READY_EVENT = "story-branch-tree:ready";
@@ -1459,8 +1468,22 @@ async function openStoryLibrary(rebuild = false) {
   root.querySelector('[data-role="canvas"]').hidden = true;
   const library = root.querySelector('[data-role="story-library"]');
   library.hidden = false;
-  library.innerHTML = `<p>同一原生故事归为一项。“查找整个故事”可从当前聊天找回旧原生分支；“重建分组”恢复已有故事标记的记录。</p><div class="story-branch-tree__library-tools">${storyMode(ctx) !== "single" ? '<button data-action="legacy-find">从当前聊天查找整个故事</button>' : ""}<button data-action="library-rebuild">重建分组</button><button data-action="library-original">查看原始记录</button><button data-action="import-story">导入故事</button>${storyMode(ctx) === "native" ? '<button data-action="export-route">导出当前路线</button>' : ""}</div>`
-    + libraryEntries.map((entry, index) => `<article class="story-branch-tree__library-entry"><h3>${escapeHtml(entry.title)}</h3><p>${entry.routes.length} 条${entry.storyId ? "原生路线" : "聊天记录"}</p><div><button data-action="library-open" data-entry="${index}">继续</button>${entry.storyId ? `<button data-action="library-routes" data-entry="${index}">查看路线</button><button data-action="library-export" data-entry="${index}">导出故事</button><button data-action="library-delete" data-entry="${index}">删除故事</button>` : ""}</div><div data-role="library-routes" hidden>${entry.routes.map(route => `<button data-action="library-chat" data-chat-name="${escapeAttribute(route.chatName)}">${escapeHtml(route.title)}</button>`).join("")}</div></article>`).join("");
+  library.innerHTML = `<div class="story-branch-tree__library-tools">${storyMode(ctx) !== "single" ? '<button data-action="legacy-find">从当前聊天查找整个故事</button>' : ""}<button data-action="library-rebuild">重建分组</button><button data-action="library-original">查看原始记录</button><button data-action="import-story">导入故事</button>${storyMode(ctx) === "native" ? '<button data-action="export-route">导出当前路线</button>' : ""}</div>`
+    + libraryEntries.map((entry, index) => `<article class="story-branch-tree__library-entry"><h3>${escapeHtml(entry.title)}</h3><p>${entry.routes.length} 条${entry.storyId ? "原生路线" : "聊天记录"}</p><div><button data-action="library-open" data-entry="${index}">继续</button>${entry.storyId ? `<button data-action="library-tree" data-entry="${index}">查看分支树</button><button data-action="library-export" data-entry="${index}">导出故事</button><button data-action="library-delete" data-entry="${index}">删除故事</button>` : ""}</div></article>`).join("");
+}
+
+async function openLibraryStoryTree(entry) {
+  if (state.busy || isGenerating()) throw Error("请等待当前操作结束。");
+  const ctx = context();
+  if (!isSoloChat(ctx) || !entry?.storyId || !entry.routes?.length) throw Error("故事列表已改变，请重新打开列表。");
+  const characterId = ctx.characterId;
+  const current = entry.routes.find(route => route.chatName === ctx.chatId);
+  const route = current ?? [...entry.routes].sort((a, b) => b.updated - a.updated)[0];
+  if (!current) await openLibraryChat(route.chatName);
+  const loaded = context();
+  if (!isSoloChat(loaded) || loaded.characterId !== characterId || loaded.chatId !== route.chatName
+    || loaded?.chatMetadata?.[NATIVE_KEY]?.storyId !== entry.storyId) throw Error("故事记录已改变，请重新打开列表。");
+  openTree();
 }
 
 async function findLegacyStory() {
@@ -1476,10 +1499,10 @@ async function findLegacyStory() {
     document.querySelector('#story-branch-tree [data-role="status"]').textContent = "旧原生分支 · 整理预览";
     const usable = plan.rows.filter(row => !row.blocked).length;
     const alreadyGrouped = !plan.rows.some(row => !row.blocked && !row.existing);
-    library.innerHTML = `<h3>找到 ${usable} 条可整理记录</h3><p>故事：${escapeHtml(plan.title)}</p><p>核对后选择要归组的记录。各聊天文件和记忆仍分别保留；不会补回过去未保存的记忆。</p>`
+    library.innerHTML = `<h3>找到 ${usable} 条可整理记录</h3><p>故事：${escapeHtml(plan.title)}</p>`
       + (plan.missing.length ? `<p>未找到来源聊天：${plan.missing.map(escapeHtml).join("、")}。可以整理现存分支，无法恢复已删正文。</p>` : "")
       + plan.rows.map(row => `<label class="story-branch-tree__legacy-row"><input type="checkbox" data-role="legacy-choice" value="${escapeAttribute(row.chatName)}" ${!row.blocked && (!row.checkpoint || row.chatName === context().chatId || row.existing) ? "checked" : ""} ${row.blocked || row.existing || row.chatName === context().chatId ? "disabled" : ""}><span><strong>${escapeHtml(row.chatName)}</strong><small>${escapeHtml(row.blocked || `${row.messageCount} 楼 · ${row.existing ? "已归组" : row.checkpoint ? "原生检查点（可选）" : row.parentName ? `来源：${row.parentName} · ${row.floor ? `第 ${row.floor} 楼分叉` : "分叉位置未知"}` : "来源起点"}`)}</small></span></label>`).join("")
-      + `<p data-role="legacy-progress" aria-live="polite">${usable < 2 ? "没有找到其他可归组记录。若文件改名或来源关联丢失，目前无法自动找全。" : alreadyGrouped ? "这些记录已归为同一故事，无需重复整理。" : "只按明确来源关联查找，不根据相似名称收录聊天。"}</p><div class="story-branch-tree__library-tools"><button data-action="legacy-accept" ${usable < 2 || alreadyGrouped ? "disabled" : ""}>整理所选记录</button><button data-action="legacy-cancel">返回列表</button></div>`;
+      + `<p data-role="legacy-progress" aria-live="polite">${usable < 2 ? "没有找到其他可归组记录。若文件改名或来源关联丢失，目前无法自动找全。" : alreadyGrouped ? "这些记录已归为同一故事，无需重复整理。" : ""}</p><div class="story-branch-tree__library-tools"><button data-action="legacy-accept" ${usable < 2 || alreadyGrouped ? "disabled" : ""}>整理所选记录</button><button data-action="legacy-cancel">返回列表</button></div>`;
   } catch (error) {
     if (!controller.signal.aborted) { progress(error.message); throw error; }
     progress("已取消查找，未整理任何记录。");
@@ -1613,10 +1636,12 @@ function closeTree() {
 }
 
 function closeConfirmation() {
+  const help = pendingConfirmation?.kind === "help";
   const dialog = document.getElementById("story-branch-tree-confirm");
   if (dialog) dialog.hidden = true;
   pendingConfirmation = null;
   document.body.classList.remove("story-branch-tree-confirm-open");
+  if (help) document.querySelector('#story-branch-tree [data-action="story-help"]')?.focus();
 }
 
 function openConfirmation(request, title, message, acceptLabel) {
@@ -1624,6 +1649,8 @@ function openConfirmation(request, title, message, acceptLabel) {
   if (!dialog) throw new Error("确认弹窗未加载。");
   const ctx = context();
   pendingConfirmation = { ...request, chatId: ctx.chatId, characterId: ctx.characterId, groupId: ctx.groupId };
+  dialog.classList.toggle("is-help", request.kind === "help");
+  dialog.querySelector('[data-action="confirm-cancel"]').hidden = request.kind === "help";
   dialog.querySelector('[data-role="confirm-title"]').textContent = title;
   dialog.querySelector('[data-role="confirm-message"]').textContent = message;
   dialog.querySelector('[data-action="confirm-accept"]').textContent = acceptLabel;
@@ -1726,6 +1753,7 @@ async function confirmPendingAction() {
   const request = pendingConfirmation;
   if (!request) return;
   closeConfirmation();
+  if (request.kind === "help") return;
   const ctx = context();
   if (!ctx || ctx.chatId !== request.chatId || ctx.characterId !== request.characterId || ctx.groupId !== request.groupId) {
     throw new Error("当前聊天已改变，请重新选择操作。");
@@ -2654,6 +2682,7 @@ function installUi(menu, markup) {
       if (button.dataset.action === "mode-single") await chooseStoryMode("single");
       if (button.dataset.action === "mode-native") await chooseStoryMode("native");
       if (button.dataset.action === "story-library") await openStoryLibrary();
+      if (button.dataset.action === "story-help") openConfirmation({ kind: "help" }, "故事与聊天说明", STORY_LIBRARY_HELP, "我知道了");
       if (button.dataset.action === "library-rebuild") await openStoryLibrary(true);
       if (button.dataset.action === "legacy-find") await findLegacyStory();
       if (button.dataset.action === "legacy-cancel") {
@@ -2679,11 +2708,7 @@ function installUi(menu, markup) {
         const route = current ?? [...entry.routes].sort((a, b) => b.updated - a.updated)[0];
         await openLibraryChat(route.chatName);
       }
-      if (button.dataset.action === "library-chat") await openLibraryChat(button.dataset.chatName);
-      if (button.dataset.action === "library-routes") {
-        const list = button.closest("article").querySelector('[data-role="library-routes"]');
-        list.hidden = !list.hidden;
-      }
+      if (button.dataset.action === "library-tree") await openLibraryStoryTree(libraryEntries[Number(button.dataset.entry)]);
       if (button.dataset.action === "library-export") {
         const entry = libraryEntries[Number(button.dataset.entry)];
         if (entry?.storyId) await exportNativeStory(true, entry.storyId);
@@ -3159,6 +3184,11 @@ function installUi(menu, markup) {
   };
   canvas.addEventListener("wheel", canvasWheelHandler, { passive: false });
   canvasKeyHandler = (event) => {
+    if (event.key === "Tab" && pendingConfirmation?.kind === "help" && !confirmDialog.hidden) {
+      event.preventDefault();
+      confirmDialog.querySelector('[data-action="confirm-accept"]').focus();
+      return;
+    }
     if (event.key !== "Escape") return;
     if (confirmDialog && !confirmDialog.hidden) closeConfirmation();
     else if (treePanel.hidden) return;
