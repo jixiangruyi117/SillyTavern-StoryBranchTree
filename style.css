@@ -1,3 +1,11 @@
+:host {
+  /* TT supplies effective insets; zero also means the host already avoided them. */
+  --sbt-safe-top: var(--tt-inset-top, env(safe-area-inset-top, 0px));
+  --sbt-safe-right: var(--tt-inset-right, env(safe-area-inset-right, 0px));
+  --sbt-safe-bottom: var(--tt-inset-bottom, env(safe-area-inset-bottom, 0px));
+  --sbt-safe-left: var(--tt-inset-left, env(safe-area-inset-left, 0px));
+}
+
 :host *,
 :host *::before,
 :host *::after {
@@ -44,6 +52,7 @@ body.story-branch-tree-confirm-open {
   flex-direction: column;
   width: 100vw;
   height: 100dvh;
+  padding: var(--sbt-safe-top) var(--sbt-safe-right) var(--sbt-safe-bottom) var(--sbt-safe-left);
   color: var(--SmartThemeBodyColor, #eee);
   background: var(--SmartThemeBlurTintColor, var(--SmartThemeChatTintColor, #171717));
   -webkit-backdrop-filter: blur(14px) saturate(0.92);
@@ -828,7 +837,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   inset: 0;
   display: grid;
   place-items: center;
-  padding: 1em;
+  padding: calc(1em + var(--sbt-safe-top)) calc(1em + var(--sbt-safe-right)) calc(1em + var(--sbt-safe-bottom)) calc(1em + var(--sbt-safe-left));
   background: #0008;
 }
 
@@ -841,7 +850,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   flex-direction: column;
   gap: 0.75em;
   width: min(30em, 100%);
-  max-height: min(90dvh, calc(100dvh - 2em));
+  max-height: min(90dvh, calc(100dvh - 2em - var(--sbt-safe-top) - var(--sbt-safe-bottom)));
   box-sizing: border-box;
   overflow-y: auto;
   padding: 1.1em;
@@ -909,7 +918,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   box-sizing: border-box;
   width: 100vw;
   height: 100dvh;
-  padding: 1em;
+  padding: calc(1em + var(--sbt-safe-top)) calc(1em + var(--sbt-safe-right)) calc(1em + var(--sbt-safe-bottom)) calc(1em + var(--sbt-safe-left));
   color: var(--SmartThemeBodyColor, #eee);
   background: #0009;
 }
@@ -955,7 +964,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   inset: 0;
   display: grid;
   place-items: center;
-  padding: 1em;
+  padding: calc(1em + var(--sbt-safe-top)) calc(1em + var(--sbt-safe-right)) calc(1em + var(--sbt-safe-bottom)) calc(1em + var(--sbt-safe-left));
   background: #0009;
 }
 
@@ -967,7 +976,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
   display: flex;
   flex-direction: column;
   width: min(42em, 100%);
-  max-height: min(80dvh, 52em, calc(100dvh - 2em));
+  max-height: min(80dvh, 52em, calc(100dvh - 2em - var(--sbt-safe-top) - var(--sbt-safe-bottom)));
   box-sizing: border-box;
   overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--SmartThemeQuoteColor, #b9915a) 55%, transparent);
@@ -1065,7 +1074,7 @@ body:not(.hideAllSwipeButtons) #chat .mes.story-branch-tree__history-swipes :is(
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 0.35em 0.5em;
     min-height: 0;
-    padding: 0.4em max(0.55em, env(safe-area-inset-right)) 0.45em max(0.55em, env(safe-area-inset-left));
+    padding: 0.4em 0.55em 0.45em;
   }
 
   .story-branch-tree__heading h2 {

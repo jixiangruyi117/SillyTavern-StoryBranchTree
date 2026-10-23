@@ -3321,7 +3321,7 @@ export async function activate() {
   try {
     const markup = await ctx.renderExtensionTemplateAsync(EXTENSION_FOLDER, "settings", {});
     if (uiActivation !== attempt || !extensionEnabled) return;
-    surface = createUiSurface(new URL("./style.css?v=0.1.82", import.meta.url).href);
+    surface = createUiSurface(new URL("./style.css?v=0.1.83", import.meta.url).href);
     uiSurface = surface;
     await surface.ready;
     if (uiActivation !== attempt || !extensionEnabled) return;

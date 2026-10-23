@@ -1,10 +1,10 @@
 {
   "display_name": "剧情分支树",
   "loading_order": 9998,
-  "js": "index.js?v=0.1.82",
-  "css": "style.css?v=0.1.82",
+  "js": "index.js?v=0.1.83",
+  "css": "style.css?v=0.1.83",
   "author": "Story Branch Tree contributors",
-  "version": "0.1.82",
+  "version": "0.1.83",
   "description": "单人剧情分支树：可选单聊天存储或酒馆原生分支，聊天列表按故事归组。",
   "homePage": "https://github.com/jixiangruyi117/SillyTavern-StoryBranchTree",
   "auto_update": true,
